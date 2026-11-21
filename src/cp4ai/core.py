@@ -9,17 +9,21 @@ What this package guarantees
   at the image's position, whether Pandoc emitted a Markdown link or an HTML
   ``<img>`` tag. Image files are *not* copied into the output.
 * Every PDF keeps its digital text layer and page order, with page boundaries
-  marked as ``<!-- page N of M -->``. Text that exists only inside PDF images
-  (screenshots, table fragments, diagrams) is OCR'd and appended on the same
-  page, under a clearly marked OCR comment.
+  marked as ``<!-- page N of M -->``. Image placements are found across
+  optional-content layers, painted-over images are skipped, and each surviving
+  placement is OCR'd with its page-relative position. Text that exists only
+  inside PDF images (screenshots, table fragments, diagrams) is appended on
+  the same page under a clearly marked OCR comment.
 * OCR uses Tesseract, which the user must provide on ``PATH``. Transparent
   images are handled by Tesseract directly.
 * DOCX comments are inserted next to the passage they annotate, with author
   and date; comments without a visible anchor go into an appendix. Pandoc
   preserves the anchors as ``comment-start``/``comment-end`` spans.
 * PPTX slides are marked ``<!-- slide N of M -->``; speaker notes and comments
-  are appended at the end of each slide. PPTX image OCR has no minimum-length
-  filter and includes shape coordinates when available.
+  are appended at the end of each slide. PPTX image OCR includes shape
+  coordinates when available.
+* OCR text shorter than 10 non-whitespace characters is dropped for every
+  format, without a placeholder.
 * A few DOCX files contain EMF/vector drawings. EMF+ bitmaps are extracted
   directly from the EMF record and OCR'd; classic EMF/SVG are rasterised with
   libemf2svg + librsvg. Only images that still fail are listed in a short
@@ -61,7 +65,7 @@ import struct
 import subprocess
 import tempfile
 import zipfile
-from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import NamedTuple
@@ -76,7 +80,6 @@ pymupdf.use_layout(True)
 logger = logging.getLogger(__name__)
 
 from .pandoc import pandoc_binary, pandoc_version
-from .progress import ocr_done, page_done
 from .resource_paths import helper_command
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -123,7 +126,7 @@ def clean_text(text: str) -> str:
     text = re.sub(r"(?<=\d)\s*\[(st|nd|rd|th)\]", r"\1", text, flags=re.IGNORECASE)
     lines = []
     for line in text.splitlines():
-        lines.append(line.rstrip())
+        lines.append(line.rstrip("\r \t"))
     text = "\n".join(lines)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -205,6 +208,16 @@ def is_ordered_subsequence_after_stripping_whitespace(
 # ---------------------------------------------------------------------------
 # DOCX conversion
 # ---------------------------------------------------------------------------
+
+
+def _work_add_images(work, count: int) -> None:
+    if work is not None:
+        work.add_images(count)
+
+
+def _work_image_finished(work) -> None:
+    if work is not None:
+        work.image_finished()
 
 
 def docx_xml_text(data: bytes) -> str:
@@ -723,10 +736,20 @@ def ocr_image_file(
     workdir: Path,
     index: int,
     cache: dict[tuple, str] | None = None,
+    preloaded: dict[Path, str] | None = None,
 ) -> str:
-    """OCR a raster image, converting EMF/EMF+/SVG to PNG first if needed."""
+    """OCR a raster image, converting EMF/EMF+/SVG to PNG first if needed.
+
+    ``preloaded`` holds results from queue jobs keyed by resolved source path.
+    It keeps vector images from being rendered and OCR'd a second time during
+    assembly.
+    """
+    resolved = path.resolve()
+    if preloaded is not None and resolved in preloaded:
+        return preloaded[resolved]
     if path.suffix.lower() in {".emf", ".wmf", ".svg"}:
-        png_path = workdir / f"vector_{index}.png"
+        stamp = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
+        png_path = workdir / f"vector_{stamp}.png"
         if not vector_to_png(path, png_path, workdir):
             return ""
         return ocr_image_cached(png_path, cache)
@@ -755,6 +778,7 @@ def replace_docx_images(
     workdir: Path,
     cache: dict[tuple, str],
     use_ocr: bool = True,
+    preloaded: dict[Path, str] | None = None,
 ) -> tuple[str, list[Path], set[Path]]:
     """Replace every DOCX image link or ``<img>`` tag with its OCR text."""
     failed_vectors: list[Path] = []
@@ -769,23 +793,29 @@ def replace_docx_images(
             return "", label, f"<!-- image not extracted: {label} -->"
 
         counter += 1
-        referenced.add(image_path)
+        referenced.add(image_path.resolve())
         if not use_ocr:
             return "", label, f"<!-- image omitted: {label} (OCR disabled) -->"
-        text = ocr_image_file(image_path, workdir, counter, cache)
-        ocr_done()
+        text = ocr_image_file(
+            image_path,
+            workdir,
+            counter,
+            cache,
+            preloaded,
+        )
         if text and useful_ocr(text):
             return text, label, None
         if image_path.suffix.lower() in {".emf", ".wmf", ".svg"}:
             failed_vectors.append(image_path)
             return "", label, f"<!-- vector image not OCR'd: {label} -->"
-        return "", label, f"<!-- image omitted: {label} (no readable text detected) -->"
+        # Fewer than 10 non-whitespace characters: drop the image entirely.
+        return "", label, ""
 
     def markdown_repl(match: re.Match[str]) -> str:
         alt = match.group(1).strip()
         source = match.group(2).strip()
         text, label, note = image_text(source, alt)
-        if note:
+        if note is not None:
             return note
 
         # Keep table rows intact: a multi-line blockquote would break the table.
@@ -806,7 +836,7 @@ def replace_docx_images(
         alt_match = HTML_IMG_ALT_RE.search(tag)
         alt = html.unescape(alt_match.group(2)) if alt_match else ""
         text, label, note = image_text(src_match.group(2), alt)
-        if note:
+        if note is not None:
             return note
 
         line_start = markdown.rfind("\n", 0, match.start()) + 1
@@ -842,6 +872,7 @@ def figures_section(
     workdir: Path,
     cache: dict[tuple, str],
     use_ocr: bool = True,
+    preloaded: dict[Path, str] | None = None,
 ) -> tuple[str, int, list[Path]]:
     """OCR images that Pandoc extracted but could not place in the body.
 
@@ -858,14 +889,18 @@ def figures_section(
     figures: list[tuple[str, str]] = []
     failed_vectors: list[Path] = []
     index = 5000
-    for image_path in sorted((p for p in media_dir.rglob("*") if p.is_file()), key=natural_key):
+    for image_path in sorted(
+        (p for p in media_dir.rglob("*") if p.is_file()),
+        key=natural_key,
+    ):
+        if any(part.startswith(".") for part in image_path.relative_to(media_dir).parts):
+            continue
         if image_path.suffix.lower() not in image_suffixes:
             continue
         if image_path.resolve() in referenced:
             continue
         index += 1
-        text = ocr_image_file(image_path, workdir, index, cache)
-        ocr_done()
+        text = ocr_image_file(image_path, workdir, index, cache, preloaded)
         if text and useful_ocr(text):
             figures.append((image_path.name, text))
         elif image_path.suffix.lower() in {".emf", ".wmf", ".svg"}:
@@ -905,44 +940,174 @@ def vector_note(vector_files: list[Path]) -> str:
     return "\n".join(lines)
 
 
-def convert_docx(
+def collect_docx_image_urls(markdown: str, media_dir: Path, workdir: Path) -> list[Path]:
+    """Every image the final body pass may OCR, in first-reference order."""
+    urls: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(source: str) -> None:
+        path = resolve_docx_media(source, media_dir, workdir)
+        if not path.exists():
+            return
+        resolved = path.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            urls.append(resolved)
+
+    for match in IMAGE_RE.finditer(markdown):
+        add(match.group(2).strip())
+    for match in HTML_IMG_RE.finditer(markdown):
+        src_match = HTML_IMG_SRC_RE.search(match.group(0))
+        if src_match:
+            add(src_match.group(2))
+    return urls
+
+
+def media_image_urls(media_dir: Path) -> list[Path]:
+    """All image files Pandoc extracted, including floating figures."""
+    suffixes = {
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp",
+        ".emf", ".wmf", ".svg",
+    }
+    if not media_dir.exists():
+        return []
+    found: list[Path] = []
+    for path in media_dir.rglob("*"):
+        if any(part.startswith(".") for part in path.relative_to(media_dir).parts):
+            continue
+        if path.is_file() and path.suffix.lower() in suffixes:
+            found.append(path.resolve())
+    return sorted(found, key=natural_key)
+
+
+def preload_docx_image(
+    image: Path,
+    workdir: Path,
+    cache: dict[tuple, str],
+    preloaded: dict[Path, str],
+) -> None:
+    try:
+        text = ocr_image_file(image, workdir, 0, cache)
+    except Exception:  # noqa: BLE001 - an unreadable image contributes no text
+        text = ""
+    preloaded[image.resolve()] = text
+
+
+@dataclass
+class DocxContext:
+    temporary: tempfile.TemporaryDirectory
+    workdir: Path
+    media_dir: Path
+    body: str
+    comments: list[dict[str, str]]
+    header: str
+    cache: dict[tuple, str]
+    preloaded: dict[Path, str]
+
+
+def prepare_docx(
     path: Path,
-    out_path: Path,
-    use_ocr: bool = True,
-) -> str:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="cp4ai_docx_") as tmp:
-        workdir = Path(tmp)
+    use_ocr: bool,
+    queue=None,
+    work=None,
+) -> DocxContext:
+    temporary = tempfile.TemporaryDirectory(prefix="cp4ai_docx_")
+    try:
+        workdir = Path(temporary.name)
         pandoc = pandoc_binary()
-        cmd = [
-            pandoc,
-            str(path.resolve()),
-            "--from=docx",
-            "--to=gfm",
-            "--wrap=none",
-            "--markdown-headings=atx",
-            "--track-changes=all",
-            "--extract-media=media",
-        ]
         proc = subprocess.run(
-            cmd, check=False, cwd=workdir, capture_output=True, text=True
+            [
+                pandoc,
+                str(path.resolve()),
+                "--from=docx",
+                "--to=gfm",
+                "--wrap=none",
+                "--markdown-headings=atx",
+                "--track-changes=all",
+                "--extract-media=media",
+            ],
+            check=False,
+            cwd=workdir,
+            capture_output=True,
+            text=True,
         )
         if proc.returncode != 0:
             raise RuntimeError(f"Pandoc failed for {path}:\n{proc.stderr}")
 
+        body = proc.stdout.strip()
         media_dir = workdir / "media"
-        ocr_cache: dict[tuple, str] = {}
-        body, failed_vectors, referenced = replace_docx_images(
-            proc.stdout.strip(), media_dir, workdir, ocr_cache, use_ocr
-        )
-        figures, figure_count, more_failed = figures_section(
-            media_dir, referenced, workdir, ocr_cache, use_ocr
-        )
-        vector_files = sorted(set(failed_vectors + more_failed), key=natural_key)
-        header = extract_docx_header(path)
+        cache: dict[tuple, str] = {}
+        preloaded: dict[Path, str] = {}
+
+        if use_ocr:
+            urls = collect_docx_image_urls(body, media_dir, workdir)
+            urls.extend(media_image_urls(media_dir))
+            unique: list[Path] = []
+            seen: set[Path] = set()
+            for url in urls:
+                resolved = url.resolve()
+                if resolved not in seen:
+                    seen.add(resolved)
+                    unique.append(resolved)
+            _work_add_images(work, len(unique))
+            for url in unique:
+                def job(image: Path = url) -> None:
+                    try:
+                        preload_docx_image(image, workdir, cache, preloaded)
+                    finally:
+                        _work_image_finished(work)
+
+                if queue is None:
+                    job()
+                else:
+                    queue.add(job)
+
         comments = extract_docx_comments(path)
-        body, unplaced_comments = insert_comments_inline(body, comments)
-        page_done()
+        header = extract_docx_header(path)
+        return DocxContext(
+            temporary=temporary,
+            workdir=workdir,
+            media_dir=media_dir,
+            body=body,
+            comments=comments,
+            header=header,
+            cache=cache,
+            preloaded=preloaded,
+        )
+    except BaseException:
+        temporary.cleanup()
+        raise
+
+
+def assemble_docx(
+    context: DocxContext,
+    path: Path,
+    out_path: Path,
+    use_ocr: bool,
+) -> str:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    body, failed_vectors, referenced = replace_docx_images(
+        context.body,
+        context.media_dir,
+        context.workdir,
+        context.cache,
+        use_ocr,
+        context.preloaded,
+    )
+    figures, figure_count, more_failed = figures_section(
+        context.media_dir,
+        referenced,
+        context.workdir,
+        context.cache,
+        use_ocr,
+        context.preloaded,
+    )
+    vector_files = sorted(
+        set(failed_vectors + more_failed),
+        key=natural_key,
+    )
+    body, unplaced_comments = insert_comments_inline(body, context.comments)
+    header = context.header
 
     pieces = [
         front_matter(
@@ -950,7 +1115,7 @@ def convert_docx(
             "docx",
             converter=f"pandoc {pandoc_version()}",
             header=header or None,
-            comments=len(comments) if comments else None,
+            comments=len(context.comments) if context.comments else None,
             images_ocr=ocr_engine_label(use_ocr),
         ),
         "",
@@ -970,9 +1135,21 @@ def convert_docx(
     )
     write_markdown(out_path, "\n".join(pieces))
     return (
-        f"docx, {len(comments)} comment(s), {figure_count} floating figure(s), "
+        f"docx, {len(context.comments)} comment(s), {figure_count} floating figure(s), "
         f"{len(vector_files)} vector image(s) not OCR'd"
     )
+
+
+def convert_docx(
+    path: Path,
+    out_path: Path,
+    use_ocr: bool = True,
+) -> str:
+    context = prepare_docx(path, use_ocr)
+    try:
+        return assemble_docx(context, path, out_path, use_ocr)
+    finally:
+        context.temporary.cleanup()
 
 
 # ---------------------------------------------------------------------------
@@ -1173,6 +1350,7 @@ def _replace_pptx_images(
     image_coords: dict[str, tuple[int, int, int, int]],
     slide_width: int,
     slide_height: int,
+    preloaded: dict[Path, str] | None = None,
 ) -> str:
     counter = 0
 
@@ -1195,10 +1373,13 @@ def _replace_pptx_images(
         else:
             counter += 1
             text = ocr_image_file(
-                image_path, workdir, counter, cache
+                image_path, workdir, counter, cache, preloaded
             )
-            ocr_done()
-            note = "" if text.strip() else f"<!-- image omitted: {label} (no readable text detected) -->"
+            if not useful_ocr(text):
+                # Fewer than 10 non-whitespace characters: drop the image and
+                # its position entirely, matching the macOS pipeline.
+                return ""
+            note = ""
 
         line_start = markdown.rfind("\n", 0, match.start()) + 1
         line_end = markdown.find("\n", match.end())
@@ -1265,15 +1446,55 @@ def _split_pptx_slides(markdown: str) -> tuple[str, list[str]]:
     return preamble, chunks
 
 
-def convert_pptx(
+def collect_pptx_image_urls(markdown: str, media_dir: Path, workdir: Path) -> list[Path]:
+    urls: list[Path] = []
+    seen: set[Path] = set()
+    for match in PPTX_IMAGE_RE.finditer(markdown):
+        source = match.group(2).strip()
+        path = resolve_docx_media(source, media_dir, workdir)
+        if not path.exists():
+            continue
+        resolved = path.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            urls.append(resolved)
+    return urls
+
+
+def preload_pptx_image(
+    image: Path,
+    workdir: Path,
+    cache: dict[tuple, str],
+    preloaded: dict[Path, str],
+) -> None:
+    try:
+        text = ocr_image_file(image, workdir, 0, cache)
+    except Exception:  # noqa: BLE001 - an unreadable image contributes no text
+        text = ""
+    preloaded[image.resolve()] = text
+
+
+@dataclass
+class PptxContext:
+    temporary: tempfile.TemporaryDirectory
+    workdir: Path
+    media_dir: Path
+    body: str
+    metadata: list[dict[str, object]]
+    cache: dict[tuple, str]
+    preloaded: dict[Path, str]
+
+
+def prepare_pptx(
     path: Path,
-    out_path: Path,
-    use_ocr: bool = True,
-) -> str:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    use_ocr: bool,
+    queue=None,
+    work=None,
+) -> PptxContext:
     metadata = _pptx_metadata(path)
-    with tempfile.TemporaryDirectory(prefix="cp4ai_pptx_") as tmp:
-        workdir = Path(tmp)
+    temporary = tempfile.TemporaryDirectory(prefix="cp4ai_pptx_")
+    try:
+        workdir = Path(temporary.name)
         pandoc = pandoc_binary()
         proc = subprocess.run(
             [
@@ -1293,53 +1514,109 @@ def convert_pptx(
         if proc.returncode != 0:
             raise RuntimeError(f"Pandoc failed for {path}:\n{proc.stderr}")
 
+        body = proc.stdout.strip()
         media_dir = workdir / "media"
-        ocr_cache: dict[tuple, str] = {}
-        preamble, chunks = _split_pptx_slides(proc.stdout.strip())
-        if preamble and chunks:
-            chunks[0] = preamble + "\n\n" + chunks[0]
-        elif preamble:
-            chunks = [preamble]
+        cache: dict[tuple, str] = {}
+        preloaded: dict[Path, str] = {}
 
-        total = max(len(chunks), len(metadata))
-        rendered: list[str] = []
-        for index in range(total):
-            chunk = chunks[index] if index < len(chunks) else ""
-            meta = metadata[index] if index < len(metadata) else {}
-            image_coords = meta.get("images", {}) if meta else {}
-            chunk = _replace_pptx_images(
-                chunk,
-                media_dir,
-                workdir,
-                ocr_cache,
-                use_ocr,
-                image_coords,
-                int(meta.get("width", 0)),
-                int(meta.get("height", 0)),
-            )
-            chunk = _append_pptx_slide_meta(chunk, meta)
-            body = f"<!-- slide {index + 1} of {total} -->"
-            if chunk:
-                body += f"\n\n{chunk}"
-            rendered.append(body)
-            page_done()
+        if use_ocr:
+            urls = collect_pptx_image_urls(body, media_dir, workdir)
+            _work_add_images(work, len(urls))
+            for url in urls:
+                def job(image: Path = url) -> None:
+                    try:
+                        preload_pptx_image(image, workdir, cache, preloaded)
+                    finally:
+                        _work_image_finished(work)
 
-    notes_count = sum(1 for meta in metadata if str(meta.get("notes", "")).strip())
-    comments_count = sum(len(meta.get("comments", [])) for meta in metadata)
+                if queue is None:
+                    job()
+                else:
+                    queue.add(job)
+
+        return PptxContext(
+            temporary=temporary,
+            workdir=workdir,
+            media_dir=media_dir,
+            body=body,
+            metadata=metadata,
+            cache=cache,
+            preloaded=preloaded,
+        )
+    except BaseException:
+        temporary.cleanup()
+        raise
+
+
+def assemble_pptx(
+    context: PptxContext,
+    path: Path,
+    out_path: Path,
+    use_ocr: bool,
+) -> str:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    preamble, chunks = _split_pptx_slides(context.body)
+    if preamble and chunks:
+        chunks[0] = preamble + "\n\n" + chunks[0]
+    elif preamble:
+        chunks = [preamble]
+
+    total = max(len(chunks), len(context.metadata))
+    rendered: list[str] = []
+    for index in range(total):
+        chunk = chunks[index] if index < len(chunks) else ""
+        meta = context.metadata[index] if index < len(context.metadata) else {}
+        image_coords = meta.get("images", {}) if meta else {}
+        chunk = _replace_pptx_images(
+            chunk,
+            context.media_dir,
+            context.workdir,
+            context.cache,
+            use_ocr,
+            image_coords,
+            int(meta.get("width", 0)),
+            int(meta.get("height", 0)),
+            context.preloaded,
+        )
+        chunk = _append_pptx_slide_meta(chunk, meta)
+        body = f"<!-- slide {index + 1} of {total} -->"
+        if chunk:
+            body += f"\n\n{chunk}"
+        rendered.append(body)
+
+    notes_count = sum(
+        1 for meta in context.metadata if str(meta.get("notes", "")).strip()
+    )
+    comments_count = sum(len(meta.get("comments", [])) for meta in context.metadata)
     header = front_matter(
         path,
         "pptx",
         converter=f"pandoc {pandoc_version()}",
-        slides=len(metadata) or total,
+        slides=len(context.metadata) or total,
         notes=notes_count or None,
         comments=comments_count or None,
         images_ocr=ocr_engine_label(use_ocr),
     )
-    write_markdown(out_path, f"{header}\n\n# {md_title(path)}\n\n" + "\n\n".join(rendered))
+    write_markdown(
+        out_path,
+        f"{header}\n\n# {md_title(path)}\n\n" + "\n\n".join(rendered),
+    )
     return (
-        f"pptx, {len(metadata) or total} slide(s), {notes_count} note(s), "
+        f"pptx, {len(context.metadata) or total} slide(s), {notes_count} note(s), "
         f"{comments_count} comment(s)"
     )
+
+
+def convert_pptx(
+    path: Path,
+    out_path: Path,
+    use_ocr: bool = True,
+) -> str:
+    context = prepare_pptx(path, use_ocr)
+    try:
+        return assemble_pptx(context, path, out_path, use_ocr)
+    finally:
+        context.temporary.cleanup()
 
 
 # ---------------------------------------------------------------------------
@@ -1347,52 +1624,269 @@ def convert_pptx(
 # ---------------------------------------------------------------------------
 
 
-def merge_boxes(boxes: Iterable[pymupdf.Rect], gap: float = 6.0) -> list[pymupdf.Rect]:
-    """Merge neighbouring image fragments (e.g. a table split across images)."""
-    pending = [pymupdf.Rect(box) for box in boxes]
-    pending = [box for box in pending if not box.is_empty]
-    while True:
-        merged: list[pymupdf.Rect] = []
-        changed = False
-        for box in pending:
-            for index, existing in enumerate(merged):
-                expanded = pymupdf.Rect(
-                    existing.x0 - gap,
-                    existing.y0 - gap,
-                    existing.x1 + gap,
-                    existing.y1 + gap,
-                )
-                if expanded.intersects(box):
-                    merged[index] = existing | box
-                    changed = True
-                    break
-            else:
-                merged.append(box)
-        if not changed:
-            return merged
-        pending = merged
+@dataclass
+class PDFImagePlacement:
+    file: Path
+    bbox: tuple[float, float, float, float]
+    sha256: str
+    kind: str
+    width: int
+    height: int
 
 
-def page_image_boxes(
+@dataclass
+class PDFPage:
+    number: int
+    markdown: str
+    width: float
+    height: float
+    images: list[PDFImagePlacement]
+
+
+def _bbox_contains(
+    outer: pymupdf.Rect,
+    inner: pymupdf.Rect,
+    tolerance: float = 0.5,
+) -> bool:
+    return (
+        outer.x0 <= inner.x0 + tolerance
+        and outer.y0 <= inner.y0 + tolerance
+        and outer.x1 >= inner.x1 - tolerance
+        and outer.y1 >= inner.y1 - tolerance
+    )
+
+
+def _image_is_fully_opaque(
+    doc: pymupdf.Document,
+    info: dict,
+    cache: dict[int, bool],
+) -> bool:
+    """Return True only when the image has no transparency.
+
+    A soft mask that is entirely 255 is still opaque. Unknown and color-key
+    masks are treated conservatively as transparent, so the lower image is
+    never skipped.
+    """
+    xref = int(info.get("xref") or 0)
+    if xref <= 0:
+        return False
+    if xref in cache:
+        return cache[xref]
+
+    if not info.get("has-mask"):
+        cache[xref] = True
+        return True
+
+    try:
+        extracted = doc.extract_image(xref)
+        smask = int(extracted.get("smask") or 0)
+        if smask <= 0:
+            cache[xref] = False
+            return False
+        mask = pymupdf.Pixmap(doc, smask)
+        opaque = bool(mask.samples) and all(value == 255 for value in mask.samples)
+        cache[xref] = opaque
+        return opaque
+    except Exception:  # noqa: BLE001 - uncertain masks keep both images
+        cache[xref] = False
+        return False
+
+
+def _layer_ui_items(doc: pymupdf.Document) -> list[dict]:
+    try:
+        return [
+            item
+            for item in doc.layer_ui_configs()
+            if item.get("type") in {"checkbox", "radiobox"}
+        ]
+    except Exception:  # noqa: BLE001 - no layer UI is a valid state
+        return []
+
+
+def _restore_layer_state(
+    doc: pymupdf.Document,
+    items: list[dict],
+    original: dict[int, bool],
+) -> None:
+    for item in items:
+        number = item["number"]
+        action = 0 if original.get(number) else 2
+        try:
+            doc.set_layer_ui_config(number, action=action)
+        except Exception as exc:  # noqa: BLE001 - restore the states that still work
+            logger.debug("could not restore layer %s: %s", number, exc)
+
+
+def _collect_pdf_placements(
+    doc: pymupdf.Document,
     page: pymupdf.Page,
-) -> tuple[list[pymupdf.Rect], list[pymupdf.Rect], int]:
-    page_area = page.rect.get_area()
-    foreground: list[pymupdf.Rect] = []
-    background: list[pymupdf.Rect] = []
-    infos = page.get_image_info(xrefs=True)
-    for info in infos:
-        box = pymupdf.Rect(info["bbox"]) & page.rect
-        if box.is_empty or box.width < 80 or box.height < 40:
-            continue
-        if box.get_area() < page_area * 0.008:
-            continue
-        if box.width / max(box.height, 1) > 20 or box.height / max(box.width, 1) > 20:
-            continue
-        if box.get_area() >= page_area * 0.85:
-            background.append(box)
-        else:
-            foreground.append(box)
-    return foreground, background, len(infos)
+) -> list[dict]:
+    """Collect visible image placements across the default and isolated layers."""
+    items = _layer_ui_items(doc)
+    original = {item["number"]: bool(item.get("on")) for item in items}
+    states: list[int | None] = [None]
+    states.extend(item["number"] for item in items)
+
+    placements: list[dict] = []
+    seen: set[tuple] = set()
+    opacity_cache: dict[int, bool] = {}
+
+    def collect_state() -> None:
+        infos = page.get_image_info(xrefs=True)
+        clipped: list[tuple[dict, pymupdf.Rect]] = []
+        for info in infos:
+            box = pymupdf.Rect(info["bbox"]) & page.rect
+            if box.is_empty or box.width <= 1 or box.height <= 1:
+                continue
+            clipped.append((info, box))
+
+        opaque = [
+            _image_is_fully_opaque(doc, info, opacity_cache)
+            for info, _box in clipped
+        ]
+
+        survivors: list[tuple[dict, pymupdf.Rect, bool]] = []
+        for index, (info, box) in enumerate(clipped):
+            covered = any(
+                _bbox_contains(other_box, box) and opaque[other_index]
+                for other_index, (_other, other_box) in enumerate(clipped)
+                if other_index > index
+            )
+            if not covered:
+                survivors.append((info, box, opaque[index]))
+
+        for info, box, is_opaque in survivors:
+            xref = int(info.get("xref") or 0)
+            key = (
+                xref,
+                tuple(round(value, 1) for value in box),
+                bytes(info.get("digest") or b""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            overlaps = any(
+                other_box.intersects(box)
+                for other, other_box, _ in survivors
+                if other is not info
+            )
+            placements.append(
+                {
+                    "bbox": (float(box.x0), float(box.y0), float(box.x1), float(box.y1)),
+                    "xref": xref,
+                    "digest": bytes(info.get("digest") or b"").hex(),
+                    "opaque": is_opaque,
+                    "overlap": overlaps,
+                    "info": info,
+                }
+            )
+
+    try:
+        for target in states:
+            try:
+                if target is None:
+                    _restore_layer_state(doc, items, original)
+                else:
+                    for item in items:
+                        doc.set_layer_ui_config(item["number"], action=2)
+                    doc.set_layer_ui_config(target, action=0)
+                collect_state()
+            except Exception:
+                if target is None:
+                    raise
+                continue
+    finally:
+        _restore_layer_state(doc, items, original)
+
+    return placements
+
+
+def _render_pdf_image(
+    doc: pymupdf.Document,
+    page: pymupdf.Page,
+    placement: dict,
+    output: Path,
+    index: int,
+) -> PDFImagePlacement:
+    box = pymupdf.Rect(placement["bbox"]) & page.rect
+    file = output / f"p{page.number + 1:04d}_i{index:04d}.png"
+    xref = placement["xref"]
+    if placement["overlap"] and xref > 0:
+        try:
+            pix = pymupdf.Pixmap(doc, xref)
+            pix.save(str(file))
+        except Exception:  # noqa: BLE001 - fall back to a clean page crop
+            pix = page.get_pixmap(clip=box, dpi=300, alpha=False)
+            pix.save(str(file))
+    else:
+        pix = page.get_pixmap(clip=box, dpi=300, alpha=False)
+        pix.save(str(file))
+
+    return PDFImagePlacement(
+        file=file,
+        bbox=placement["bbox"],
+        sha256=hashlib.sha256(file.read_bytes()).hexdigest(),
+        kind="image",
+        width=round(box.width),
+        height=round(box.height),
+    )
+
+
+def _render_full_page(page: pymupdf.Page, output: Path) -> PDFImagePlacement:
+    file = output / f"p{page.number + 1:04d}_page.png"
+    pix = page.get_pixmap(dpi=300, alpha=False)
+    pix.save(str(file))
+    return PDFImagePlacement(
+        file=file,
+        bbox=(0.0, 0.0, float(page.rect.width), float(page.rect.height)),
+        sha256=hashlib.sha256(file.read_bytes()).hexdigest(),
+        kind="page",
+        width=round(page.rect.width),
+        height=round(page.rect.height),
+    )
+
+
+def _page_has_text(page: pymupdf.Page) -> bool:
+    return len(token_set(page.get_text())) >= 40
+
+
+def extract_pdf_pages(path: Path, output: Path) -> list[PDFPage]:
+    """Extract native page Markdown plus one PNG per visible image placement.
+
+    This is the same discovery model as the macOS 3.2 PDF helper: image objects,
+    optional-content layer states, opaque-cover skipping, raw XObject extraction
+    for overlapping images, and a full-page fallback for low-text vector pages.
+    """
+    output.mkdir(parents=True, exist_ok=True)
+    doc = pymupdf.open(path)
+    try:
+        chunks = doc.to_markdown(
+            page_chunks=True, show_progress=False, use_ocr=False
+        )
+        pages: list[PDFPage] = []
+        for index, chunk in enumerate(chunks):
+            page = doc[index] if index < doc.page_count else None
+            images: list[PDFImagePlacement] = []
+            if page is not None:
+                placements = _collect_pdf_placements(doc, page)
+                for image_index, placement in enumerate(placements):
+                    images.append(
+                        _render_pdf_image(doc, page, placement, output, image_index)
+                    )
+                if not placements and not _page_has_text(page):
+                    images.append(_render_full_page(page, output))
+            pages.append(
+                PDFPage(
+                    number=index + 1,
+                    markdown=chunk.get("text", "") or "",
+                    width=float(page.rect.width) if page is not None else 0.0,
+                    height=float(page.rect.height) if page is not None else 0.0,
+                    images=images,
+                )
+            )
+        return pages
+    finally:
+        doc.close()
 
 
 def count_pages(path: Path) -> int:
@@ -1412,10 +1906,15 @@ def _count_pdf_ocr_jobs(path: Path) -> int:
     jobs = 0
     with pymupdf.open(path) as doc:
         for page in doc:
-            foreground, background, _ = page_image_boxes(page)
-            jobs += len(merge_boxes(foreground))
-            if background and len(token_set(page.get_text())) < 40:
-                jobs += len(merge_boxes(background))
+            infos = page.get_image_info(xrefs=True)
+            count = sum(
+                1
+                for info in infos
+                if not (pymupdf.Rect(info["bbox"]) & page.rect).is_empty
+            )
+            if count == 0 and not _page_has_text(page):
+                count = 1
+            jobs += count
     return jobs
 
 
@@ -1456,105 +1955,136 @@ def count_ocr_jobs(path: Path) -> int:
     return 0
 
 
-def ocr_page_images(
-    page: pymupdf.Page,
-    page_number: int,
-    workdir: Path,
-    cache: dict[tuple, str],
-    native_text: str,
+def _round_percent(value: float) -> int:
+    """Round half away from zero, matching Swift's ``rounded()``."""
+    if value >= 0:
+        return int(value + 0.5)
+    return int(value - 0.5)
+
+
+def _pdf_position(
+    bbox: tuple[float, float, float, float],
+    page_width: float,
+    page_height: float,
 ) -> str:
-    foreground, background, info_count = page_image_boxes(page)
-    logger.info("page %d: image_infos=%d", page_number, info_count)
-
-    def run_boxes(boxes: list[pymupdf.Rect], offset: int) -> list[str]:
-        results: list[str] = []
-        for index, box in enumerate(merge_boxes(boxes)):
-            pix = page.get_pixmap(clip=box, dpi=300, alpha=False)
-            # Reuse OCR only for a bit-identical rendered region. Image xrefs
-            # and box size do not determine the pixels (vector text overlays
-            # and shared backgrounds can differ), so hash the pixels instead.
-            digest = hashlib.sha256(pix.samples).digest()
-            cache_key = (pix.width, pix.height, len(pix.samples), digest)
-            if cache_key in cache:
-                text = cache[cache_key]
-            else:
-                image_path = workdir / f"page_{page_number:04d}_{offset + index}.png"
-                pix.save(image_path)
-                text = ocr_image(image_path)
-                cache[cache_key] = text
-            ocr_done()
-            if text and useful_ocr(text):
-                results.append(text)
-        return results
-
-    logger.info(
-        "page %d: foreground=%d background=%d native_tokens=%d",
-        page_number,
-        len(foreground),
-        len(background),
-        len(token_set(native_text)),
+    if len(bbox) != 4 or page_width <= 0 or page_height <= 0:
+        return ""
+    top = _round_percent(bbox[1] / page_height * 100)
+    left = _round_percent(bbox[0] / page_width * 100)
+    width = _round_percent((bbox[2] - bbox[0]) / page_width * 100)
+    height = _round_percent((bbox[3] - bbox[1]) / page_height * 100)
+    top = max(0, min(100, top))
+    left = max(0, min(100, left))
+    width = max(0, min(100, width))
+    height = max(0, min(100, height))
+    return (
+        f"[top: {top}%, left: {left}%, "
+        f"width: {width}%, height: {height}%]"
     )
-    native_tokens = len(token_set(native_text))
-    regions: list[str] = []
-    if foreground:
-        # The common case: a real screenshot/table on a page whose full-page
-        # image is just a background scan. OCR the foreground only.
-        regions = run_boxes(foreground, 0)
-        # A nearly blank native text layer plus almost no foreground text means
-        # the page may be a full-page scan; fall back to the whole page.
-        if native_tokens < 40 and len(token_set("\n".join(regions))) < 20 and background:
-            regions = run_boxes(background, 50)
-    elif background and native_tokens < 40:
-        # Scanned page with no separate foreground images.
-        regions = run_boxes(background, 50)
-    return "\n\n".join(regions)
 
 
-def convert_pdf(
+def _pdf_blockquote(text: str, label: str, position: str) -> str:
+    heading = f"> **Image text (OCR) — {label}"
+    if position:
+        heading += f" — {position}"
+    heading += "**"
+    lines = [heading, ">"]
+    lines.extend(
+        f"> {line}" if line.strip() else ">"
+        for line in text.splitlines()
+    )
+    return "\n".join(lines)
+
+
+@dataclass
+class PDFContext:
+    temporary: tempfile.TemporaryDirectory
+    pages: list[PDFPage]
+    cache: dict[str, str]
+
+
+def prepare_pdf(
+    path: Path,
+    use_ocr: bool,
+    queue=None,
+    work=None,
+) -> PDFContext:
+    temporary = tempfile.TemporaryDirectory(prefix="cp4ai_pdf_")
+    try:
+        pages = extract_pdf_pages(path, Path(temporary.name))
+        cache: dict[str, str] = {}
+        if use_ocr:
+            for page in pages:
+                for image in page.images:
+                    _work_add_images(work, 1)
+
+                    def job(item: PDFImagePlacement = image) -> None:
+                        try:
+                            if item.sha256 not in cache:
+                                cache[item.sha256] = ocr_image(item.file)
+                        except Exception:  # noqa: BLE001 - empty OCR is dropped
+                            cache[item.sha256] = ""
+                        finally:
+                            _work_image_finished(work)
+
+                    if queue is None:
+                        job()
+                    else:
+                        queue.add(job)
+        return PDFContext(temporary=temporary, pages=pages, cache=cache)
+    except BaseException:
+        temporary.cleanup()
+        raise
+
+
+def assemble_pdf(
+    context: PDFContext,
     path: Path,
     out_path: Path,
-    use_ocr: bool = True,
+    use_ocr: bool,
 ) -> str:
-    doc = pymupdf.open(path)
-    try:
-        chunks = doc.to_markdown(
-            page_chunks=True, show_progress=False, use_ocr=False
-        )
-        parts: list[str] = []
-        ocr_pages = 0
-        cache: dict[tuple, str] = {}
-        with tempfile.TemporaryDirectory(prefix="cp4ai_pdf_") as tmp:
-            workdir = Path(tmp)
-            for page_index, chunk in enumerate(chunks):
-                page = doc[page_index]
-                native = clean_text(chunk.get("text", ""))
-                ocr_text = ""
-                if use_ocr:
-                    ocr_text = ocr_page_images(
-                        page, page_index + 1, workdir, cache, native
+    total = len(context.pages)
+    parts: list[str] = []
+    ocr_pages = 0
+
+    for page in context.pages:
+        native = clean_text(page.markdown)
+        blocks: list[str] = []
+        if use_ocr:
+            for image in page.images:
+                text = context.cache.get(image.sha256)
+                if text is None:
+                    try:
+                        text = ocr_image(image.file)
+                    except Exception:  # noqa: BLE001 - an unreadable image adds nothing
+                        text = ""
+                    context.cache[image.sha256] = text
+                if not useful_ocr(text):
+                    continue
+                if is_ordered_subsequence_after_stripping_whitespace(text, native):
+                    continue
+                blocks.append(
+                    _pdf_blockquote(
+                        text,
+                        "full page" if image.kind == "page" else "image",
+                        _pdf_position(image.bbox, page.width, page.height),
                     )
-                    if ocr_text and is_ordered_subsequence_after_stripping_whitespace(
-                        ocr_text, native
-                    ):
-                        ocr_text = ""
-                if ocr_text:
-                    ocr_pages += 1
-
-                page_body = native
-                if ocr_text:
-                    page_body += f"\n\n{OCR_COMMENT}\n\n{ocr_text}"
-
-                parts.append(
-                    f"<!-- page {page_index + 1} of {len(chunks)} -->\n\n{page_body.strip()}"
                 )
-                page_done()
-    finally:
-        doc.close()
+
+        if blocks:
+            ocr_pages += 1
+        body = native
+        if blocks:
+            ocr = OCR_COMMENT + "\n\n" + "\n\n".join(blocks)
+            body = ocr if not body else body + "\n\n" + ocr
+        parts.append(
+            f"<!-- page {page.number} of {total} -->\n\n{body.strip()}"
+        )
 
     header = front_matter(
         path,
         "pdf",
-        pages=len(chunks),
+        pages=total,
         text_extraction=f"pymupdf {pymupdf.__version__}",
         images_ocr=(
             f"{ocr_engine_label(use_ocr)} ({ocr_pages} page(s) with OCR text)"
@@ -1563,4 +2093,16 @@ def convert_pdf(
         ),
     )
     write_markdown(out_path, f"{header}\n\n# {md_title(path)}\n\n" + "\n\n".join(parts))
-    return f"pdf, {len(chunks)} pages, OCR on {ocr_pages} page(s)"
+    return f"pdf, {total} pages, OCR on {ocr_pages} page(s)"
+
+
+def convert_pdf(
+    path: Path,
+    out_path: Path,
+    use_ocr: bool = True,
+) -> str:
+    context = prepare_pdf(path, use_ocr)
+    try:
+        return assemble_pdf(context, path, out_path, use_ocr)
+    finally:
+        context.temporary.cleanup()

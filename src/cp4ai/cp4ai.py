@@ -16,6 +16,7 @@ from .pipeline import (
     copy_to_clipboard,
     filter_sources,
 )
+from .progress import CLIProgressReporter
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,17 +37,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--jobs",
         type=int,
         default=os.cpu_count() or 1,
-        help="parallel worker processes (default: CPU cores)",
+        help="parallel workers (default: CPU cores)",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
 
-def run_cli_progress():
+def run_cli_progress(reporter: CLIProgressReporter):
     pending: dict[int, tuple[int, Path, str | None, str | None]] = {}
     next_index = 1
 
     def _emit(index: int, count: int, source: Path, details: str | None, error: str | None) -> None:
+        reporter.clear_line()
         if error:
             print(f"[{index}/{count}] FAILED {source}: {error}", file=sys.stderr)
         else:
@@ -82,16 +84,21 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     jobs = max(1, args.jobs)
+    reporter = CLIProgressReporter()
     try:
         result = convert_batch(
             sources,
             use_ocr=use_ocr,
             jobs=jobs,
-            progress=run_cli_progress(),
+            progress=run_cli_progress(reporter),
+            work_progress=reporter,
+            file_started=reporter.started,
         )
     except BatchFailure as exc:
         print(f"{len(exc.errors)} file(s) failed; clipboard not changed", file=sys.stderr)
         return 1
+    finally:
+        reporter.finish()
 
     try:
         copy_to_clipboard(result.markdown)

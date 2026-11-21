@@ -5,12 +5,12 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from . import __version__
 from .core import convert_docx, convert_pdf, convert_pptx
-from .pipeline import check_pandoc, check_tesseract
+from .pipeline import check_pandoc, check_tesseract, run_batch
+from .progress import CLIProgressReporter
 
 SOURCE_SUFFIXES = {".docx", ".pdf", ".pptx"}
 
@@ -105,44 +105,33 @@ def run_conversions(
     for _, output in planned:
         output.parent.mkdir(parents=True, exist_ok=True)
 
+    reporter = CLIProgressReporter()
+    try:
+        outcomes = run_batch(
+            [source for source, _output in planned],
+            [output for _source, output in planned],
+            use_ocr=use_ocr,
+            jobs=max(1, jobs),
+            work_progress=reporter,
+            file_started=reporter.started,
+        )
+    finally:
+        reporter.finish()
+
     failures = 0
-    total = len(planned)
-    if jobs <= 1 or total == 1:
-        for index, (source, output) in enumerate(planned, start=1):
-            try:
-                details = convert_one(source, output, use_ocr)
-            except Exception as exc:  # noqa: BLE001 - keep the batch going
-                failures += 1
-                print(f"[{index}/{total}] FAILED {source}: {exc}", file=sys.stderr)
-            else:
-                print(f"[{index}/{total}] {source} -> {output} ({details})")
-        return failures
-
-    workers = min(jobs, total)
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(convert_one, source, output, use_ocr): (index, source, output)
-            for index, (source, output) in enumerate(planned, start=1)
-        }
-        completed: dict[int, tuple[bool, str]] = {}
-        next_index = 1
-        for future in as_completed(futures):
-            index, source, output = futures[future]
-            try:
-                details = future.result()
-            except Exception as exc:  # noqa: BLE001 - keep the batch going
-                completed[index] = (False, f"FAILED {source}: {exc}")
-            else:
-                completed[index] = (True, f"{source} -> {output} ({details})")
-
-            while next_index in completed:
-                ok, message = completed.pop(next_index)
-                if ok:
-                    print(f"[{next_index}/{total}] {message}")
-                else:
-                    failures += 1
-                    print(f"[{next_index}/{total}] {message}", file=sys.stderr)
-                next_index += 1
+    total = len(outcomes)
+    for index, outcome in enumerate(outcomes, start=1):
+        if outcome.error is not None:
+            failures += 1
+            print(
+                f"[{index}/{total}] FAILED {outcome.source}: {outcome.error}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[{index}/{total}] {outcome.source} -> {outcome.output} "
+                f"({outcome.details})"
+            )
     return failures
 
 
@@ -180,7 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--jobs",
         type=int,
         default=os.cpu_count() or 1,
-        help="parallel worker processes (default: CPU cores)",
+        help="parallel workers (default: CPU cores)",
     )
     parser.add_argument(
         "--no-ocr",

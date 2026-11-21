@@ -20,7 +20,7 @@ The Linux tools are:
 
 It keeps headings, lists, tables, footnotes, comments, speaker notes, page and
 slide boundaries, and text found inside images. The conversion pipeline
-mirrors the macOS variant; the intended platform differences are the OCR
+mirrors the macOS 3.2 variant; the intended platform differences are the OCR
 engine (Tesseract here, Apple Vision on macOS) and the clipboard tool.
 
 The two vector-image helpers, **librsvg** and **libemf2svg**, are bundled for
@@ -213,14 +213,19 @@ a non-zero status. `cp4ai` accepts only files, not directories.
   which tools were used.
 - PDF pages marked `<!-- page N of M -->`; PPTX slides marked
   `<!-- slide N of M -->`.
-- Image text under a clearly marked `Image text (OCR)` blockquote.
+- Image text under a clearly marked `Image text (OCR)` blockquote. PDF blocks
+  include `[top: …, left: …, width: …, height: …]` percentages; PPTX blocks
+  include them when the slide XML has picture coordinates.
+- OCR text shorter than 10 non-whitespace characters is dropped entirely,
+  without a placeholder, for every format.
 - DOCX comments next to the passage they annotate, with author and date.
   Comments without an anchor go into an appendix.
 - PPTX speaker notes and comments after their slide.
 - DOCX floating/anchored images that Pandoc could not place in the body in a
   `## Figures from the original document (OCR text)` section.
-- A `## Vector images (not OCR'd)` list if an EMF/SVG drawing could not be
-  rendered.
+- A `## Vector images (not OCR'd)` list if an EMF, WMF or SVG drawing could
+  not be rendered. PPTX drops an unrenderable vector picture like empty OCR
+  text.
 
 Image files themselves are never copied into the Markdown.
 
@@ -231,7 +236,7 @@ Image files themselves are never copied into the Markdown.
 ```text
 cp4ai / md4ai
 ├── CLI + conversion pipeline (Python)
-├── PyMuPDF              PDF text extraction and region rendering
+├── PyMuPDF              PDF text extraction and placement rendering
 ├── Tesseract            OCR (best of four page-segmentation modes)
 └── resources/
     ├── helpers.zip
@@ -249,7 +254,7 @@ executables are the two vector converters, which are extracted from
 `helpers.zip` into the user's cache and launched through the bundled musl
 loader.
 
-This pipeline intentionally follows the macOS 3.1 implementation. The
+This pipeline intentionally follows the macOS 3.2 implementation. The
 remaining differences are the OCR engine (Tesseract here) and platform
 integration (clipboard tools, install paths).
 
@@ -268,21 +273,52 @@ integration (clipboard tools, install paths).
 5. Unusual images are rasterised before OCR:
    - EMF+ bitmaps are read directly from the EMF record;
    - classic EMF goes through `emf2svg-conv`, then `rsvg-convert`;
-   - SVG goes through `rsvg-convert`.
+   - SVG goes through `rsvg-convert`;
+   - WMF has no renderer and is reported as a vector image that was not OCR'd.
 6. The media directory is temporary and deleted afterwards.
 
 ### PDF
 
-1. PyMuPDF extracts the native text layer page by page with layout enabled and
-   its own OCR disabled.
-2. It finds image regions, merges fragments, renders them at 300 dpi and OCRs
-   foreground regions first.
-3. If a page has little native text and the foreground result is thin, the
-   full-page background image is OCR'd as a fallback.
-4. Pages are marked `<!-- page N of M -->`; OCR text is appended on the same
-   page under a marked comment.
-5. Foreground/background splitting prevents full-page template images from
-   duplicating the native text layer.
+1. PyMuPDF extracts the native text layer one page chunk at a time with layout
+   enabled and its own OCR disabled.
+2. Native page Markdown is normalised: `ff`, `fi`, `fl`, `ffi` and `ffl`
+   ligatures expand; no-break spaces become spaces; soft hyphens are removed;
+   ordinal brackets such as `1[st]` become `1st`; trailing spaces, tabs and
+   carriage returns are trimmed from each line; runs of three or more newlines
+   collapse to two; outer whitespace is trimmed.
+3. Image discovery uses the PDF image objects, not layout inference. It scans
+   the default layer state plus each checkbox/radio layer with a UI entry,
+   hiding all layers and then enabling one at a time, and unions the visible
+   placements. Bounding boxes are clipped to the page; placements 1 pt or
+   smaller in either dimension are ignored. Placements are deduplicated by
+   xref, bbox rounded to 0.1 pt and image digest.
+4. A placement is skipped when a later-painted image completely contains its
+   clipped bbox (0.5 pt tolerance) and is fully opaque. Fully opaque means no
+   mask, or a soft mask whose bytes are all 255. Unknown and color-key masks
+   are treated as transparent, and PDF graphics-state transparency is not
+   analysed. The rule is applied per layer state, so a lower image that is
+   visible in another state is still kept.
+5. A surviving placement that intersects another surviving placement in the
+   same state is OCR'd from the raw image XObject so the crop cannot contain
+   the other image; if that extraction fails it falls back to a page crop.
+   Other placements are rendered from the page at 300 dpi. Positions use the
+   clipped bbox.
+6. If a page has no placements and fewer than 40 distinct native word tokens,
+   the full page is rendered at 300 dpi for OCR. A token is a lowercase run of
+   at least two ASCII letters or digits from `page.get_text()`; this catches
+   vector-only pages whose text was converted to outlines.
+7. Pages are marked `<!-- page N of M -->`. When at least one OCR block
+   survives the filters, the page gets one OCR warning comment followed by one
+   blockquote per surviving image. Placements are emitted in discovery order:
+   default state first, then each isolated layer, with paint order inside a
+   state. OCR is dropped when it has fewer than 10 non-whitespace characters
+   or when the deduplication rule below matches the same page. Positions are
+   page-relative integer percentages rounded to the nearest 1% and clamped to
+   0–100%. Ordinary placements are labelled `image`; a full-page fallback is
+   labelled `full page`.
+8. Images that exist only as PDF annotations, and vector-only content on
+   hidden layers, are outside image-object discovery. The full-page fallback
+   uses the default layer state.
 
 ### PPTX
 
@@ -291,9 +327,12 @@ integration (clipboard tools, install paths).
 2. The package parses the PPTX XML for slide order, speaker notes, comments and
    picture coordinates.
 3. Slides are marked `<!-- slide N of M -->`.
-4. Images are replaced by OCR text. When a picture position is available it is
-   appended as percentages rounded to the nearest 10%:
-   `**Position:** [top: 45%, left: 60%, width: 40%, height: 20%]`.
+4. Images are replaced by OCR text. Pictures in pipe-table rows use inline
+   text. When a picture position is available it is appended as percentages
+   rounded to the nearest 10% and clamped to 0–100%. A normal picture gets
+   `- **Position:** [top: 45%, left: 60%, width: 40%, height: 20%]`; a picture
+   inside a pipe table gets `<br>**Position:** [...]` inline. OCR text under
+   10 non-whitespace characters drops the image and its position.
 5. Speaker notes and comments are appended at the end of their slide.
 
 ### OCR
@@ -315,8 +354,8 @@ confidence × (words / max_words)
 ```
 
 This discounts a result that dropped table rows; it never rewards extra words.
-Each region uses one Tesseract process at a time (`OMP_THREAD_LIMIT=1`);
-document-level parallelism is controlled by `--jobs`.
+Each image placement uses one Tesseract process at a time
+(`OMP_THREAD_LIMIT=1`); the job queue controls parallelism with `--jobs`.
 
 ### Text-layer deduplication
 
@@ -332,6 +371,11 @@ Case, punctuation and repeated characters still matter. Native
 `adjourn court` is kept because the order is wrong. A bag-of-words match is
 not enough.
 
+For PDF, this check runs separately for every image placement, after the
+10-character drop, against the cleaned native text of the same page. Two images
+on the same page can both contribute the same OCR text; only text already
+present in the native layer is removed. It is not used for DOCX or PPTX.
+
 ### Vector images
 
 - **EMF+** records are parsed directly: the embedded BGRA/BGR bitmap is
@@ -339,8 +383,11 @@ not enough.
 - **EMF** is converted to SVG with `emf2svg-conv`, then to PNG with
   `rsvg-convert`.
 - **SVG** is rendered with `rsvg-convert`.
-- If none of these produce an image, the file is listed under
-  `## Vector images (not OCR'd)` rather than silently dropped.
+- **WMF** has no renderer; DOCX reports it as a vector image that was not OCR'd.
+- If none of these produce an image, a DOCX file is listed under
+  `## Vector images (not OCR'd)` rather than silently dropped. PPTX has no
+  vector-failure list; its unrenderable vector pictures are dropped like empty
+  OCR text.
 
 The helpers are musl-linked, so the same bundle runs on glibc and musl hosts.
 They are launched through the bundled loader with `--library-path`.
@@ -353,9 +400,25 @@ counts using `tiktoken`.
 
 ### Parallelism
 
-The CLI defaults to one worker process per active CPU core; `--jobs N` changes
-it. `md4ai` checks all output paths before starting, so a batch fails before
-any file is written if an output would collide or already exists.
+Both CLIs use one dynamic job queue:
+
+1. **Text extraction** — Pandoc for DOCX/PPTX.
+2. **PDF extraction** — PyMuPDF produces page Markdown and per-image
+   placement PNGs.
+3. **OCR** — Tesseract processes one image placement.
+
+Each document starts with an extraction job. When it finishes, it enqueues its
+OCR jobs; extraction for other documents continues while those OCR jobs run.
+There is no stage barrier between documents. The queue has N workers, each
+worker executes one job at a time on one thread, and jobs never spawn nested
+worker pools.
+
+`--jobs N` sets N; both CLIs default to all active CPU cores. OCR text is not
+inserted while the queue is running. Once the queue is completely drained,
+Python assembles every document in input order, replaces images with the cached
+OCR text and writes the outputs. `md4ai` checks all output paths before starting,
+so a batch fails before any file is written if an output would collide or
+already exists.
 
 ### Design choices
 

@@ -3,23 +3,16 @@
 from __future__ import annotations
 
 import logging
-import multiprocessing
 import shutil
 import subprocess
 import tempfile
 import threading
 from collections.abc import Callable, Iterable, Sequence
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
-from .progress import (
-    CallbackSink,
-    QueueSink,
-    WorkState,
-    WorkTotals,
-    set_sink,
-)
+from .jobs import JobQueue
+from .progress import BatchProgressTracker, WorkState, WorkTotals
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +33,14 @@ class BatchResult:
     files: list[Path]
 
 
+@dataclass(frozen=True)
+class FileOutcome:
+    source: Path
+    output: Path
+    details: str | None
+    error: str | None
+
+
 class BatchFailure(Exception):
     """Raised when one or more files failed; the clipboard is untouched."""
 
@@ -53,10 +54,7 @@ ProgressCallback = Callable[
     None,
 ]
 WorkProgressCallback = Callable[[WorkState], None]
-
-
-def _init_worker_progress(queue) -> None:
-    set_sink(QueueSink(queue))
+FileStartedCallback = Callable[[int, int, Path], None]
 
 
 def filter_sources(paths: Iterable[Path | str]) -> tuple[list[Path], list[Rejected]]:
@@ -142,6 +140,202 @@ def count_work(sources: Sequence[Path]) -> WorkTotals:
     return WorkTotals(pages=pages, ocr=ocr)
 
 
+class DocumentWork:
+    """Per-document readiness: extraction done and all OCR jobs finished."""
+
+    def __init__(
+        self,
+        index: int,
+        source: Path,
+        output: Path,
+        tracker: BatchProgressTracker,
+    ):
+        self.index = index
+        self.source = source
+        self.output = output
+        self._tracker = tracker
+        self._lock = threading.Lock()
+        self._extraction_done = False
+        self._pending_images = 0
+        self._did_mark_done = False
+        self.error: str | None = None
+        self.context = None
+
+    def add_images(self, count: int) -> None:
+        if count <= 0:
+            return
+        with self._lock:
+            self._pending_images += count
+        self._tracker.add_images(count)
+
+    def image_finished(self) -> None:
+        finished = False
+        with self._lock:
+            self._pending_images -= 1
+            if (
+                not self._did_mark_done
+                and self._extraction_done
+                and self._pending_images == 0
+            ):
+                self._did_mark_done = True
+                finished = True
+        self._tracker.image_finished()
+        if finished:
+            self._tracker.document_finished()
+
+    def extraction_finished(self) -> None:
+        finished = False
+        with self._lock:
+            self._extraction_done = True
+            if not self._did_mark_done and self._pending_images == 0:
+                self._did_mark_done = True
+                finished = True
+        if finished:
+            self._tracker.document_finished()
+
+    def fail(self, message: str) -> None:
+        finished = False
+        with self._lock:
+            self.error = message
+            self._extraction_done = True
+            if not self._did_mark_done and self._pending_images == 0:
+                self._did_mark_done = True
+                finished = True
+        if finished:
+            self._tracker.document_finished()
+
+
+def _prepare_document(source: Path, use_ocr: bool, queue: JobQueue, work: DocumentWork):
+    from .core import prepare_docx, prepare_pdf, prepare_pptx
+
+    suffix = source.suffix.lower()
+    if suffix == ".docx":
+        return prepare_docx(source, use_ocr, queue, work)
+    if suffix == ".pptx":
+        return prepare_pptx(source, use_ocr, queue, work)
+    if suffix == ".pdf":
+        return prepare_pdf(source, use_ocr, queue, work)
+    raise ValueError(f"unsupported file type: {source}")
+
+
+def _assemble_document(context, source: Path, output: Path, use_ocr: bool) -> str:
+    from .core import (
+        DocxContext,
+        PDFContext,
+        PptxContext,
+        assemble_docx,
+        assemble_pdf,
+        assemble_pptx,
+    )
+
+    if isinstance(context, DocxContext):
+        return assemble_docx(context, source, output, use_ocr)
+    if isinstance(context, PptxContext):
+        return assemble_pptx(context, source, output, use_ocr)
+    if isinstance(context, PDFContext):
+        return assemble_pdf(context, source, output, use_ocr)
+    raise RuntimeError("conversion did not produce a document context")
+
+
+def _cleanup_context(context) -> None:
+    if context is not None and hasattr(context, "temporary"):
+        context.temporary.cleanup()
+
+
+def run_batch(
+    sources: Sequence[Path],
+    outputs: Sequence[Path],
+    *,
+    use_ocr: bool,
+    jobs: int,
+    progress: ProgressCallback | None = None,
+    work_progress: WorkProgressCallback | None = None,
+    file_started: FileStartedCallback | None = None,
+) -> list[FileOutcome]:
+    """Prepare and assemble documents through one dynamic job queue.
+
+    Extraction jobs enqueue their own OCR jobs.  No OCR text is inserted while
+    the queue is running; assembly starts only after every extraction and OCR
+    job has finished, in the caller's input order.
+    """
+    sources = list(sources)
+    outputs = list(outputs)
+    if len(sources) != len(outputs):
+        raise ValueError("output count must match source count")
+    total = len(sources)
+
+    totals = count_work(sources) if work_progress is not None else WorkTotals(0, 0)
+    tracker = BatchProgressTracker(
+        documents_total=total,
+        images_total=totals.ocr if work_progress is not None else 0,
+        callback=work_progress,
+    )
+    tracker.start()
+
+    queue = JobQueue(max(1, jobs))
+    works: list[DocumentWork] = []
+    for index, (source, output) in enumerate(zip(sources, outputs)):
+        work = DocumentWork(index, source, output, tracker)
+        works.append(work)
+
+        def extraction(item: DocumentWork = work) -> None:
+            try:
+                if file_started is not None:
+                    file_started(item.index + 1, total, item.source)
+                item.context = _prepare_document(
+                    item.source,
+                    use_ocr,
+                    queue,
+                    item,
+                )
+                item.extraction_finished()
+            except Exception as exc:  # noqa: BLE001 - report and continue
+                item.fail(str(exc))
+
+        queue.add(extraction)
+
+    queue.drain()
+    tracker.reconcile()
+
+    outcomes: list[FileOutcome] = []
+    for work in works:
+        details: str | None = None
+        error = work.error
+        context = work.context
+        if error is None:
+            try:
+                details = _assemble_document(
+                    context,
+                    work.source,
+                    work.output,
+                    use_ocr,
+                )
+            except Exception as exc:  # noqa: BLE001 - report and continue
+                error = str(exc)
+            finally:
+                _cleanup_context(context)
+        else:
+            _cleanup_context(context)
+
+        outcome = FileOutcome(
+            source=work.source,
+            output=work.output,
+            details=details,
+            error=error,
+        )
+        outcomes.append(outcome)
+        if progress is not None:
+            progress(
+                work.index + 1,
+                total,
+                work.source,
+                details,
+                error,
+            )
+
+    return outcomes
+
+
 def convert_batch(
     sources: Sequence[Path],
     *,
@@ -149,26 +343,16 @@ def convert_batch(
     jobs: int,
     progress: ProgressCallback | None = None,
     work_progress: WorkProgressCallback | None = None,
+    file_started: FileStartedCallback | None = None,
 ) -> BatchResult:
     """Convert files, concatenate them, and return clipboard-ready Markdown.
 
-    Individual failures are reported through ``progress`` and collected into
-    :class:`BatchFailure`; successful files are never copied when any file
-    fails.  ``work_progress`` receives page/OCR counters aggregated across all
-    files.
+    Individual failures are collected into :class:`BatchFailure`; the
+    clipboard is never changed when any file fails.
     """
-    # Imported lazily so the CLIs can report argument errors before pymupdf,
-    # tiktoken and the rest of the conversion stack are loaded.
-    from .md4ai import convert_one
-
     sources = list(sources)
-    total = len(sources)
-    errors: list[tuple[Path, str]] = []
-    state: WorkState | None = None
-    if work_progress is not None:
-        totals = count_work(sources)
-        state = WorkState(pages_total=totals.pages, ocr_total=totals.ocr)
-        work_progress(state)
+    if not sources:
+        raise ValueError("convert_batch needs at least one source")
 
     with tempfile.TemporaryDirectory(prefix="cp4ai_clipboard_") as tmp:
         workdir = Path(tmp)
@@ -176,90 +360,22 @@ def convert_batch(
             (source, workdir / f"{index:04d}.md")
             for index, source in enumerate(sources)
         ]
-
-        use_processes = jobs > 1 and total > 1
-        if not use_processes:
-            sink = (
-                CallbackSink(state, work_progress)
-                if state is not None and work_progress is not None
-                else None
-            )
-            if sink:
-                set_sink(sink)
-            try:
-                for index, (source, output) in enumerate(planned, start=1):
-                    try:
-                        details = convert_one(source, output, use_ocr)
-                    except Exception as exc:  # noqa: BLE001 - report and continue
-                        errors.append((source, str(exc)))
-                        if progress:
-                            progress(index, total, source, None, str(exc))
-                    else:
-                        if progress:
-                            progress(index, total, source, details, None)
-            finally:
-                if sink:
-                    set_sink(None)
-        else:
-            workers = min(max(1, jobs), total)
-            queue = None
-            drain = None
-            if state is not None and work_progress is not None:
-                ctx = multiprocessing.get_context("spawn")
-                queue = ctx.Queue()
-
-                def drain_events() -> None:
-                    while True:
-                        event = queue.get()
-                        if event is None:
-                            break
-                        state.apply(event)
-                        work_progress(state)
-
-                drain = threading.Thread(target=drain_events, daemon=True)
-                drain.start()
-
-            initializer = _init_worker_progress if queue is not None else None
-            initargs = (queue,) if queue is not None else ()
-            try:
-                with ProcessPoolExecutor(
-                    max_workers=workers,
-                    initializer=initializer,
-                    initargs=initargs,
-                ) as pool:
-                    futures = {
-                        pool.submit(convert_one, source, output, use_ocr): (index, source)
-                        for index, (source, output) in enumerate(planned, start=1)
-                    }
-                    for future in as_completed(futures):
-                        index, source = futures[future]
-                        try:
-                            details = future.result()
-                        except Exception as exc:  # noqa: BLE001 - report and continue
-                            errors.append((source, str(exc)))
-                            if progress:
-                                progress(
-                                    index, total, source, None, str(exc)
-                                )
-                        else:
-                            if progress:
-                                progress(
-                                    index, total, source, details, None
-                                )
-            finally:
-                if queue is not None:
-                    queue.put(None)
-                    drain.join(timeout=10)
-                    queue.close()
-                    queue.join_thread()
-
+        outcomes = run_batch(
+            [source for source, _output in planned],
+            [output for _source, output in planned],
+            use_ocr=use_ocr,
+            jobs=jobs,
+            progress=progress,
+            work_progress=work_progress,
+            file_started=file_started,
+        )
+        errors = [
+            (outcome.source, outcome.error)
+            for outcome in outcomes
+            if outcome.error is not None
+        ]
         if errors:
             raise BatchFailure(errors)
-
-        if state is not None and work_progress is not None:
-            state.pages_total = state.pages_done
-            state.ocr_total = state.ocr_done
-            work_progress(state)
 
         sections = []
         for source, output in planned:
