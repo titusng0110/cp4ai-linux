@@ -106,32 +106,39 @@ def run_conversions(
         output.parent.mkdir(parents=True, exist_ok=True)
 
     reporter = CLIProgressReporter()
+    failures = 0
+
+    def report(
+        index: int,
+        count: int,
+        source: Path,
+        details: str | None,
+        error: str | None,
+    ) -> None:
+        nonlocal failures
+        reporter.clear_line()
+        if error is not None:
+            failures += 1
+            print(
+                f"[{index}/{count}] FAILED {source}: {error}",
+                file=sys.stderr,
+            )
+        else:
+            output = planned[index - 1][1] if 0 < index <= len(planned) else None
+            print(f"[{index}/{count}] {source} -> {output} ({details})")
+
     try:
-        outcomes = run_batch(
+        run_batch(
             [source for source, _output in planned],
             [output for _source, output in planned],
             use_ocr=use_ocr,
             jobs=max(1, jobs),
+            progress=report,
             work_progress=reporter,
             file_started=reporter.started,
         )
     finally:
         reporter.finish()
-
-    failures = 0
-    total = len(outcomes)
-    for index, outcome in enumerate(outcomes, start=1):
-        if outcome.error is not None:
-            failures += 1
-            print(
-                f"[{index}/{total}] FAILED {outcome.source}: {outcome.error}",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"[{index}/{total}] {outcome.source} -> {outcome.output} "
-                f"({outcome.details})"
-            )
     return failures
 
 
