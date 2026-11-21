@@ -43,11 +43,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_cli_progress():
-    def _progress(index: int, count: int, source: Path, details: str | None, error: str | None):
+    pending: dict[int, tuple[int, Path, str | None, str | None]] = {}
+    next_index = 1
+
+    def _emit(index: int, count: int, source: Path, details: str | None, error: str | None) -> None:
         if error:
             print(f"[{index}/{count}] FAILED {source}: {error}", file=sys.stderr)
         else:
             print(f"[{index}/{count}] {source} ({details})")
+
+    def _progress(index: int, count: int, source: Path, details: str | None, error: str | None):
+        nonlocal next_index
+        pending[index] = (count, source, details, error)
+        while next_index in pending:
+            count_i, source_i, details_i, error_i = pending.pop(next_index)
+            _emit(next_index, count_i, source_i, details_i, error_i)
+            next_index += 1
 
     return _progress
 

@@ -202,7 +202,6 @@ def convert_batch(
                     set_sink(None)
         else:
             workers = min(max(1, jobs), total)
-            completed = 0
             queue = None
             drain = None
             if state is not None and work_progress is not None:
@@ -229,24 +228,23 @@ def convert_batch(
                     initargs=initargs,
                 ) as pool:
                     futures = {
-                        pool.submit(convert_one, source, output, use_ocr): source
-                        for source, output in planned
+                        pool.submit(convert_one, source, output, use_ocr): (index, source)
+                        for index, (source, output) in enumerate(planned, start=1)
                     }
                     for future in as_completed(futures):
-                        source = futures[future]
-                        completed += 1
+                        index, source = futures[future]
                         try:
                             details = future.result()
                         except Exception as exc:  # noqa: BLE001 - report and continue
                             errors.append((source, str(exc)))
                             if progress:
                                 progress(
-                                    completed, total, source, None, str(exc)
+                                    index, total, source, None, str(exc)
                                 )
                         else:
                             if progress:
                                 progress(
-                                    completed, total, source, details, None
+                                    index, total, source, details, None
                                 )
             finally:
                 if queue is not None:

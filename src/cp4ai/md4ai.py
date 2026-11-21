@@ -121,18 +121,28 @@ def run_conversions(
     workers = min(jobs, total)
     with ProcessPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(convert_one, source, output, use_ocr): (source, output)
-            for source, output in planned
+            pool.submit(convert_one, source, output, use_ocr): (index, source, output)
+            for index, (source, output) in enumerate(planned, start=1)
         }
-        for index, future in enumerate(as_completed(futures), start=1):
-            source, output = futures[future]
+        completed: dict[int, tuple[bool, str]] = {}
+        next_index = 1
+        for future in as_completed(futures):
+            index, source, output = futures[future]
             try:
                 details = future.result()
             except Exception as exc:  # noqa: BLE001 - keep the batch going
-                failures += 1
-                print(f"[{index}/{total}] FAILED {source}: {exc}", file=sys.stderr)
+                completed[index] = (False, f"FAILED {source}: {exc}")
             else:
-                print(f"[{index}/{total}] {source} -> {output} ({details})")
+                completed[index] = (True, f"{source} -> {output} ({details})")
+
+            while next_index in completed:
+                ok, message = completed.pop(next_index)
+                if ok:
+                    print(f"[{next_index}/{total}] {message}")
+                else:
+                    failures += 1
+                    print(f"[{next_index}/{total}] {message}", file=sys.stderr)
+                next_index += 1
     return failures
 
 
