@@ -12,9 +12,8 @@ What this package guarantees
   marked as ``<!-- page N of M -->``. Text that exists only inside PDF images
   (screenshots, table fragments, diagrams) is OCR'd and appended on the same
   page, under a clearly marked OCR comment.
-* OCR defaults to Apple's Live Text through ocrmac for printed English text.
-  Transparent images are flattened onto white before recognition.
-  ``--tesseract`` selects Tesseract for every image instead.
+* OCR uses Tesseract, which the user must provide on ``PATH``. Transparent
+  images are handled by Tesseract directly.
 * DOCX comments are inserted next to the passage they annotate, with author
   and date; comments without a visible anchor go into an appendix. Pandoc
   preserves the anchors as ``comment-start``/``comment-end`` spans.
@@ -34,22 +33,20 @@ Usage
     md4ai -r notes/
     md4ai -rf notes/
     md4ai -o out/ -r notes/
-    md4ai --tesseract a.pdf
     md4ai --no-ocr a.pdf
+
+External tools
+--------------
+    Pandoc    (required for DOCX/PPTX; user-supplied on PATH)
+    Tesseract (required for OCR unless --no-ocr; user-supplied on PATH)
 
 Reproducible environment
 ------------------------
     Python 3.13
     pymupdf==2.1
-    Pandoc 3.14                 (bundled in the macOS app; CLI uses pandoc)
     numpy==2.5.5
-    tabulate==0.10.0
     ftfy==6.3.1
-    ocrmac==1.0.1                (Apple Live Text; macOS Sonoma+)
-    pillow==13.0.0
     tiktoken==0.14.0
-    psutil==7.2.2
-    Tesseract 5.5.4              (optional; --tesseract)
 """
 
 from __future__ import annotations
@@ -61,13 +58,10 @@ import logging
 import os
 import posixpath
 import re
-import shutil
 import struct
 import subprocess
 import tempfile
 import zipfile
-
-import ftfy
 from collections.abc import Iterable
 from datetime import date
 from pathlib import Path
@@ -75,6 +69,7 @@ from typing import NamedTuple
 from urllib.parse import unquote
 from xml.etree import ElementTree as ET
 
+import ftfy
 import numpy as np
 import pymupdf
 
@@ -84,17 +79,10 @@ logger = logging.getLogger(__name__)
 
 from .pandoc import pandoc_binary, pandoc_version
 from .progress import ocr_done, page_done
+from .resource_paths import helper_command
 
 PACKAGE_DIR = Path(__file__).resolve().parent
-_REPO_ROOT = PACKAGE_DIR.parents[1] if len(PACKAGE_DIR.parents) > 1 else PACKAGE_DIR
-TESSDATA_DIR = next(
-    (
-        candidate
-        for candidate in (_REPO_ROOT / "tools" / "tessdata", PACKAGE_DIR / "tessdata")
-        if (candidate / "eng.traineddata").exists()
-    ),
-    None,
-)
+TESSDATA_DIR = PACKAGE_DIR / "resources" / "tessdata"
 
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
@@ -442,17 +430,10 @@ def unplaced_comments_appendix(comments: list[tuple[int, dict[str, str]]]) -> st
 
 OCR_PSMS = (3, 4, 6, 11)
 OCR_LANG = "eng"
-OCR_LIVETEXT_LANGS = ("en-US",)
-DEFAULT_OCR_ENGINE = "livetext"
 
 
-def ocr_engine_label(engine: str) -> str:
-    if engine == "none":
-        return "disabled"
-    if engine == "livetext":
-        languages = ", ".join(OCR_LIVETEXT_LANGS)
-        return f"ocrmac livetext ({languages})"
-    return f"tesseract 5.5.4 {OCR_LANG}"
+def ocr_engine_label(use_ocr: bool) -> str:
+    return f"tesseract {OCR_LANG}" if use_ocr else "disabled"
 
 
 class OcrResult(NamedTuple):
@@ -461,15 +442,16 @@ class OcrResult(NamedTuple):
     words: int
 
 
-def tesseract_tsv(image: Path, psm: int, tessdata_dir: Path | None) -> OcrResult:
+def tesseract_tsv(image: Path, psm: int) -> OcrResult:
     """Run Tesseract and return reconstructed text, confidence and word count.
 
     Confidence is weighted by word length, so a few long, low-confidence words
     cannot dominate the mean. No image preprocessing is applied.
     """
-    cmd = ["tesseract", str(image), "stdout", "-l", OCR_LANG, "--psm", str(psm), "tsv"]
-    if tessdata_dir and (tessdata_dir / "eng.traineddata").exists():
-        cmd.extend(["--tessdata-dir", str(tessdata_dir)])
+    cmd = ["tesseract", str(image), "stdout", "-l", OCR_LANG, "--psm", str(psm)]
+    if (TESSDATA_DIR / "eng.traineddata").is_file():
+        cmd.extend(["--tessdata-dir", str(TESSDATA_DIR)])
+    cmd.append("tsv")
     env = dict(os.environ, OMP_THREAD_LIMIT="1")
     proc = subprocess.run(cmd, check=False, capture_output=True, text=True, env=env)
     if proc.returncode != 0:
@@ -521,7 +503,7 @@ def tesseract_tsv(image: Path, psm: int, tessdata_dir: Path | None) -> OcrResult
     return OcrResult(text, mean_confidence, word_count)
 
 
-def ocr_image_tesseract(path: Path, tessdata_dir: Path | None) -> str:
+def ocr_image_tesseract(path: Path) -> str:
     """OCR one image with the same four PSM modes for DOCX and PDF.
 
     Modes:
@@ -541,7 +523,7 @@ def ocr_image_tesseract(path: Path, tessdata_dir: Path | None) -> str:
     """
     runs: list[OcrResult] = []
     for psm in OCR_PSMS:
-        result = tesseract_tsv(path, psm=psm, tessdata_dir=tessdata_dir)
+        result = tesseract_tsv(path, psm=psm)
         if result.text.strip():
             runs.append(result)
     if not runs:
@@ -566,47 +548,9 @@ def ocr_image_tesseract(path: Path, tessdata_dir: Path | None) -> str:
     return text.strip()
 
 
-def ocr_image_livetext(path: Path) -> str:
-    """OCR one image through Apple's Live Text framework via ocrmac."""
-    from ocrmac import ocrmac
-    from PIL import Image
-
-    # Live Text returns nothing for RGBA images with a transparent
-    # background (common for EMF/SVG conversions). Flatten onto white first.
-    with Image.open(path) as opened:
-        rgba = opened.convert("RGBA")
-        flattened = Image.new("RGB", rgba.size, "white")
-        flattened.paste(rgba, mask=rgba.getchannel("A"))
-
-    annotations = ocrmac.OCR(
-        flattened,
-        framework="livetext",
-        language_preference=list(OCR_LIVETEXT_LANGS),
-        unit="line",
-    ).recognize()
-    # Live Text bounding boxes use a bottom-left origin.
-    lines = sorted(annotations, key=lambda item: (-item[2][1], item[2][0]))
-    text = "\n".join(text.strip() for text, _, _ in lines if text.strip()).strip()
-    logger.info(
-        "livetext: %s size=%s annotations=%d text_len=%d first=%r",
-        path,
-        flattened.size,
-        len(annotations),
-        len(text),
-        text[:80],
-    )
-    return text
-
-
-def ocr_image(
-    path: Path,
-    tessdata_dir: Path | None,
-    engine: str = DEFAULT_OCR_ENGINE,
-) -> str:
-    """OCR one image with the selected engine."""
-    if engine == "livetext":
-        return ocr_image_livetext(path)
-    return ocr_image_tesseract(path, tessdata_dir)
+def ocr_image(path: Path) -> str:
+    """OCR one image with Tesseract."""
+    return ocr_image_tesseract(path)
 
 
 def save_bgr_png(bgr: np.ndarray, out_path: Path) -> bool:
@@ -679,15 +623,17 @@ def extract_emf_plus_bitmap(emf_path: Path, out_png: Path) -> bool:
 
 
 def svg_to_png(svg_path: Path, out_png: Path, width: int = 2400) -> bool:
-    rsvg = shutil.which("rsvg-convert")
-    logger.info("svg_to_png: rsvg=%r svg=%s", rsvg, svg_path)
-    if not rsvg:
+    helper = helper_command("rsvg-convert")
+    logger.info("svg_to_png: helper=%r svg=%s", helper, svg_path)
+    if helper is None:
         return False
+    command, env = helper
     proc = subprocess.run(
-        [rsvg, str(svg_path), "-o", str(out_png), "--width", str(width)],
+        [*command, str(svg_path), "-o", str(out_png), "--width", str(width)],
         check=False,
         capture_output=True,
         text=True,
+        env=env,
     )
     ok = proc.returncode == 0 and out_png.exists() and out_png.stat().st_size > 0
     logger.info(
@@ -707,15 +653,17 @@ def vector_to_png(source: Path, out_png: Path, workdir: Path) -> bool:
     if suffix in {".emf", ".svg"}:
         svg_path = source if suffix == ".svg" else workdir / f"{source.stem}_vector.svg"
         if suffix == ".emf":
-            converter = shutil.which("emf2svg-conv")
-            logger.info("vector_to_png: emf2svg=%r source=%s", converter, source)
-            if not converter:
+            helper = helper_command("emf2svg-conv")
+            logger.info("vector_to_png: helper=%r source=%s", helper, source)
+            if helper is None:
                 return False
+            command, env = helper
             proc = subprocess.run(
-                [converter, "-p", "-i", str(source), "-o", str(svg_path)],
+                [*command, "-p", "-i", str(source), "-o", str(svg_path)],
                 check=False,
                 capture_output=True,
                 text=True,
+                env=env,
             )
             logger.info(
                 "vector_to_png: emf rc=%d exists=%s stderr=%r",
@@ -735,18 +683,16 @@ def vector_to_png(source: Path, out_png: Path, workdir: Path) -> bool:
 
 def ocr_image_cached(
     path: Path,
-    tessdata_dir: Path | None,
     cache: dict[tuple, str] | None,
-    engine: str = DEFAULT_OCR_ENGINE,
 ) -> str:
     """OCR a file, reusing text only for bit-identical input bytes."""
     if cache is None:
-        return ocr_image(path, tessdata_dir, engine)
+        return ocr_image(path)
     data = path.read_bytes()
-    cache_key = (engine, path.suffix.lower(), len(data), hashlib.sha256(data).digest())
+    cache_key = (path.suffix.lower(), len(data), hashlib.sha256(data).digest())
     if cache_key in cache:
         return cache[cache_key]
-    text = ocr_image(path, tessdata_dir, engine)
+    text = ocr_image(path)
     cache[cache_key] = text
     return text
 
@@ -755,17 +701,15 @@ def ocr_image_file(
     path: Path,
     workdir: Path,
     index: int,
-    tessdata_dir: Path | None,
     cache: dict[tuple, str] | None = None,
-    engine: str = DEFAULT_OCR_ENGINE,
 ) -> str:
     """OCR a raster image, converting EMF/EMF+/SVG to PNG first if needed."""
     if path.suffix.lower() in {".emf", ".wmf", ".svg"}:
         png_path = workdir / f"vector_{index}.png"
         if not vector_to_png(path, png_path, workdir):
             return ""
-        return ocr_image_cached(png_path, tessdata_dir, cache, engine)
-    return ocr_image_cached(path, tessdata_dir, cache, engine)
+        return ocr_image_cached(png_path, cache)
+    return ocr_image_cached(path, cache)
 
 
 def ocr_blockquote(text: str, label: str) -> str:
@@ -788,9 +732,7 @@ def replace_docx_images(
     markdown: str,
     media_dir: Path,
     workdir: Path,
-    tessdata_dir: Path | None,
     cache: dict[tuple, str],
-    engine: str = DEFAULT_OCR_ENGINE,
     use_ocr: bool = True,
 ) -> tuple[str, list[Path], set[Path]]:
     """Replace every DOCX image link or ``<img>`` tag with its OCR text."""
@@ -809,7 +751,7 @@ def replace_docx_images(
         referenced.add(image_path)
         if not use_ocr:
             return "", label, f"<!-- image omitted: {label} (OCR disabled) -->"
-        text = ocr_image_file(image_path, workdir, counter, tessdata_dir, cache, engine)
+        text = ocr_image_file(image_path, workdir, counter, cache)
         ocr_done()
         if text and useful_ocr(text):
             return text, label, None
@@ -877,9 +819,7 @@ def figures_section(
     media_dir: Path,
     referenced: set[Path],
     workdir: Path,
-    tessdata_dir: Path | None,
     cache: dict[tuple, str],
-    engine: str = DEFAULT_OCR_ENGINE,
     use_ocr: bool = True,
 ) -> tuple[str, int, list[Path]]:
     """OCR images that Pandoc extracted but could not place in the body.
@@ -903,7 +843,7 @@ def figures_section(
         if image_path.resolve() in referenced:
             continue
         index += 1
-        text = ocr_image_file(image_path, workdir, index, tessdata_dir, cache, engine)
+        text = ocr_image_file(image_path, workdir, index, cache)
         ocr_done()
         if text and useful_ocr(text):
             figures.append((image_path.name, text))
@@ -947,8 +887,6 @@ def vector_note(vector_files: list[Path]) -> str:
 def convert_docx(
     path: Path,
     out_path: Path,
-    tessdata_dir: Path | None,
-    engine: str = DEFAULT_OCR_ENGINE,
     use_ocr: bool = True,
 ) -> str:
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -974,10 +912,10 @@ def convert_docx(
         media_dir = workdir / "media"
         ocr_cache: dict[tuple, str] = {}
         body, failed_vectors, referenced = replace_docx_images(
-            proc.stdout.strip(), media_dir, workdir, tessdata_dir, ocr_cache, engine, use_ocr
+            proc.stdout.strip(), media_dir, workdir, ocr_cache, use_ocr
         )
         figures, figure_count, more_failed = figures_section(
-            media_dir, referenced, workdir, tessdata_dir, ocr_cache, engine, use_ocr
+            media_dir, referenced, workdir, ocr_cache, use_ocr
         )
         vector_files = sorted(set(failed_vectors + more_failed), key=natural_key)
         header = extract_docx_header(path)
@@ -992,7 +930,7 @@ def convert_docx(
             converter=f"pandoc {pandoc_version()}",
             header=header or None,
             comments=len(comments) if comments else None,
-            images_ocr=ocr_engine_label(engine),
+            images_ocr=ocr_engine_label(use_ocr),
         ),
         "",
         f"# {md_title(path)}",
@@ -1209,9 +1147,7 @@ def _replace_pptx_images(
     markdown: str,
     media_dir: Path,
     workdir: Path,
-    tessdata_dir: Path | None,
     cache: dict[tuple, str],
-    engine: str,
     use_ocr: bool,
     image_coords: dict[str, tuple[int, int, int, int]],
     slide_width: int,
@@ -1238,7 +1174,7 @@ def _replace_pptx_images(
         else:
             counter += 1
             text = ocr_image_file(
-                image_path, workdir, counter, tessdata_dir, cache, engine
+                image_path, workdir, counter, cache
             )
             ocr_done()
             note = "" if text.strip() else f"<!-- image omitted: {label} (no readable text detected) -->"
@@ -1311,8 +1247,6 @@ def _split_pptx_slides(markdown: str) -> tuple[str, list[str]]:
 def convert_pptx(
     path: Path,
     out_path: Path,
-    tessdata_dir: Path | None,
-    engine: str = DEFAULT_OCR_ENGINE,
     use_ocr: bool = True,
 ) -> str:
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1356,9 +1290,7 @@ def convert_pptx(
                 chunk,
                 media_dir,
                 workdir,
-                tessdata_dir,
                 ocr_cache,
-                engine,
                 use_ocr,
                 image_coords,
                 int(meta.get("width", 0)),
@@ -1380,7 +1312,7 @@ def convert_pptx(
         slides=len(metadata) or total,
         notes=notes_count or None,
         comments=comments_count or None,
-        images_ocr=ocr_engine_label(engine),
+        images_ocr=ocr_engine_label(use_ocr),
     )
     write_markdown(out_path, f"{header}\n\n# {md_title(path)}\n\n" + "\n\n".join(rendered))
     return (
@@ -1508,9 +1440,7 @@ def ocr_page_images(
     page_number: int,
     workdir: Path,
     cache: dict[tuple, str],
-    tessdata_dir: Path | None,
     native_text: str,
-    engine: str = DEFAULT_OCR_ENGINE,
 ) -> str:
     foreground, background, info_count = page_image_boxes(page)
     logger.info("page %d: image_infos=%d", page_number, info_count)
@@ -1523,13 +1453,13 @@ def ocr_page_images(
             # and box size do not determine the pixels (vector text overlays
             # and shared backgrounds can differ), so hash the pixels instead.
             digest = hashlib.sha256(pix.samples).digest()
-            cache_key = (engine, pix.width, pix.height, len(pix.samples), digest)
+            cache_key = (pix.width, pix.height, len(pix.samples), digest)
             if cache_key in cache:
                 text = cache[cache_key]
             else:
                 image_path = workdir / f"page_{page_number:04d}_{offset + index}.png"
                 pix.save(image_path)
-                text = ocr_image(image_path, tessdata_dir, engine)
+                text = ocr_image(image_path)
                 cache[cache_key] = text
             ocr_done()
             if text and useful_ocr(text):
@@ -1563,8 +1493,6 @@ def convert_pdf(
     path: Path,
     out_path: Path,
     use_ocr: bool = True,
-    tessdata_dir: Path | None = None,
-    engine: str = DEFAULT_OCR_ENGINE,
 ) -> str:
     doc = pymupdf.open(path)
     try:
@@ -1582,7 +1510,7 @@ def convert_pdf(
                 ocr_text = ""
                 if use_ocr:
                     ocr_text = ocr_page_images(
-                        page, page_index + 1, workdir, cache, tessdata_dir, native, engine
+                        page, page_index + 1, workdir, cache, native
                     )
                     if ocr_text and token_set(ocr_text) <= token_set(native):
                         ocr_text = ""
@@ -1606,7 +1534,7 @@ def convert_pdf(
         pages=len(chunks),
         text_extraction=f"pymupdf {pymupdf.__version__}",
         images_ocr=(
-            f"{ocr_engine_label(engine)} ({ocr_pages} page(s) with OCR text)"
+            f"{ocr_engine_label(use_ocr)} ({ocr_pages} page(s) with OCR text)"
             if use_ocr
             else "disabled"
         ),

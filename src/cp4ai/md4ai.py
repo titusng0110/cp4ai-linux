@@ -4,43 +4,15 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
-import subprocess
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from . import __version__
-from .core import TESSDATA_DIR, convert_docx, convert_pdf, convert_pptx
+from .core import convert_docx, convert_pdf, convert_pptx
 from .pipeline import check_pandoc, check_tesseract
 
 SOURCE_SUFFIXES = {".docx", ".pdf", ".pptx"}
-HOMEBREW_COMMANDS = (
-    ("emf2svg-conv", "libemf2svg"),
-    ("rsvg-convert", "librsvg"),
-)
-
-
-def install_homebrew_dependencies(engine: str) -> None:
-    """Install the niche vector-image helpers when OCR is enabled.
-
-    Pandoc and Tesseract are deliberately not installed here: CLI users
-    supply Pandoc themselves, and Tesseract is opt-in via ``--tesseract``.
-    """
-    if engine == "none" or sys.platform != "darwin" or os.environ.get("CP4AI_SKIP_SETUP"):
-        return
-    brew = shutil.which("brew")
-    if not brew:
-        return
-    missing = [
-        package
-        for command, package in HOMEBREW_COMMANDS
-        if not shutil.which(command)
-    ]
-    if not missing:
-        return
-    print(f"Installing Homebrew dependencies: {' '.join(missing)}", flush=True)
-    subprocess.run([brew, "install", *missing], check=False)
 
 
 def collect_sources(target: Path, recursive: bool) -> list[Path]:
@@ -65,7 +37,7 @@ def collect_sources(target: Path, recursive: bool) -> list[Path]:
 def out_is_directory(raw: str, path: Path) -> bool:
     if path.exists() and path.is_dir():
         return True
-    if raw.endswith("/") or raw.endswith(os.sep):
+    if raw.endswith(("/", os.sep)):
         return True
     return path.suffix.lower() != ".md"
 
@@ -116,18 +88,17 @@ def check_outputs(planned: list[tuple[Path, Path]], force: bool) -> None:
         )
 
 
-def convert_one(source: Path, output: Path, use_ocr: bool, engine: str) -> str:
+def convert_one(source: Path, output: Path, use_ocr: bool) -> str:
     if source.suffix.lower() == ".docx":
-        return convert_docx(source, output, TESSDATA_DIR, engine, use_ocr)
+        return convert_docx(source, output, use_ocr)
     if source.suffix.lower() == ".pptx":
-        return convert_pptx(source, output, TESSDATA_DIR, engine, use_ocr)
-    return convert_pdf(source, output, use_ocr, TESSDATA_DIR, engine)
+        return convert_pptx(source, output, use_ocr)
+    return convert_pdf(source, output, use_ocr)
 
 
 def run_conversions(
     planned: list[tuple[Path, Path]],
     use_ocr: bool,
-    engine: str,
     jobs: int,
 ) -> int:
     for _, output in planned:
@@ -138,7 +109,7 @@ def run_conversions(
     if jobs <= 1 or total == 1:
         for index, (source, output) in enumerate(planned, start=1):
             try:
-                details = convert_one(source, output, use_ocr, engine)
+                details = convert_one(source, output, use_ocr)
             except Exception as exc:  # noqa: BLE001 - keep the batch going
                 failures += 1
                 print(f"[{index}/{total}] FAILED {source}: {exc}", file=sys.stderr)
@@ -149,7 +120,7 @@ def run_conversions(
     workers = min(jobs, total)
     with ProcessPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(convert_one, source, output, use_ocr, engine): (source, output)
+            pool.submit(convert_one, source, output, use_ocr): (source, output)
             for source, output in planned
         }
         for index, future in enumerate(as_completed(futures), start=1):
@@ -200,29 +171,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.cpu_count() or 1,
         help="parallel worker processes (default: CPU cores)",
     )
-    engines = parser.add_mutually_exclusive_group()
-    engines.add_argument(
-        "--livetext",
-        dest="ocr_engine",
-        action="store_const",
-        const="livetext",
-        help="OCR with Apple Live Text via ocrmac (default)",
-    )
-    engines.add_argument(
-        "--tesseract",
-        dest="ocr_engine",
-        action="store_const",
-        const="tesseract",
-        help="OCR with Tesseract instead of Live Text (requires: brew install tesseract)",
-    )
-    engines.add_argument(
+    parser.add_argument(
         "--no-ocr",
-        dest="ocr_engine",
-        action="store_const",
-        const="none",
-        help="do not OCR images",
+        action="store_true",
+        help="do not OCR images (Tesseract is otherwise required on PATH)",
     )
-    parser.set_defaults(ocr_engine="livetext")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
@@ -240,12 +193,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: no .docx/.pdf/.pptx files found under {target}", file=sys.stderr)
         return 1
 
-    for problem in (check_pandoc(sources), check_tesseract(args.ocr_engine)):
+    use_ocr = not args.no_ocr
+    for problem in (check_pandoc(sources), check_tesseract(use_ocr)):
         if problem:
             print(f"ERROR: {problem}", file=sys.stderr)
             return 1
-
-    install_homebrew_dependencies(args.ocr_engine)
 
     try:
         planned = plan_outputs(sources, target, args.out)
@@ -254,8 +206,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    use_ocr = args.ocr_engine != "none"
-    failures = run_conversions(planned, use_ocr, args.ocr_engine, max(1, args.jobs))
+    failures = run_conversions(planned, use_ocr, max(1, args.jobs))
     if failures:
         print(f"{failures} file(s) failed", file=sys.stderr)
         return 1

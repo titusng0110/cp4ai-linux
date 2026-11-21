@@ -1,4 +1,4 @@
-"""Copy converted documents to the macOS clipboard."""
+"""Copy converted documents to the Linux clipboard."""
 
 from __future__ import annotations
 
@@ -8,8 +8,6 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .core import DEFAULT_OCR_ENGINE
-from .md4ai import install_homebrew_dependencies
 from .pipeline import (
     BatchFailure,
     check_pandoc,
@@ -29,22 +27,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("files", nargs="+", help=".docx/.pdf/.pptx files")
-    engines = parser.add_mutually_exclusive_group()
-    engines.add_argument(
-        "--tesseract",
-        dest="ocr_engine",
-        action="store_const",
-        const="tesseract",
-        help="OCR with Tesseract instead of Live Text (requires: brew install tesseract)",
-    )
-    engines.add_argument(
+    parser.add_argument(
         "--no-ocr",
-        dest="ocr_engine",
-        action="store_const",
-        const="none",
-        help="do not OCR images",
+        action="store_true",
+        help="do not OCR images (Tesseract is otherwise required on PATH)",
     )
-    parser.set_defaults(ocr_engine=DEFAULT_OCR_ENGINE)
     parser.add_argument(
         "--jobs",
         type=int,
@@ -77,19 +64,16 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: no files to convert", file=sys.stderr)
         return 1
 
-    for problem in (check_pandoc(sources), check_tesseract(args.ocr_engine)):
+    use_ocr = not args.no_ocr
+    for problem in (check_pandoc(sources), check_tesseract(use_ocr)):
         if problem:
             print(f"ERROR: {problem}", file=sys.stderr)
             return 1
 
-    install_homebrew_dependencies(args.ocr_engine)
-
-    use_ocr = args.ocr_engine != "none"
     jobs = max(1, args.jobs)
     try:
         result = convert_batch(
             sources,
-            engine=args.ocr_engine,
             use_ocr=use_ocr,
             jobs=jobs,
             progress=run_cli_progress(),
@@ -100,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         copy_to_clipboard(result.markdown)
-    except Exception as exc:  # noqa: BLE001 - pbcopy failure
+    except Exception as exc:  # noqa: BLE001 - clipboard failure
         print(f"ERROR: could not write to clipboard: {exc}", file=sys.stderr)
         return 1
 

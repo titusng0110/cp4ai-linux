@@ -6,13 +6,11 @@ __pycache__/
 /dist/
 *.egg-info/
 
-# Native tools and downloads are fetched for a DMG build, never committed
-/packaging/native/
-/packaging/.cache/
+# Helper build scratch space
+/packaging/.out/
 
 # Temporary files and logs
 /tmp/
 convert.log
 
-# macOS
 .DS_Store

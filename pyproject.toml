@@ -4,25 +4,22 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cp4ai"
-version = "3.0.0"
+version = "3.1.0"
 description = "Copy 4 AI: convert lecture notes from DOCX, PDF and PPTX into recall-first Markdown for LLM ingestion."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "pymupdf==2.1",
-    "psutil==7.2.2",
     "numpy==2.5.5",
-    "tabulate==0.10.0",
     "ftfy==6.3.1",
-    "ocrmac==1.0.1",
-    "pillow==13.0.0",
     "tiktoken==0.14.0",
 ]
 
 [project.scripts]
 md4ai = "cp4ai.md4ai:main"
 cp4ai = "cp4ai.cp4ai:main"
+cp4ai-setup = "cp4ai.setup:main"
 
 [tool.uv]
 package = true

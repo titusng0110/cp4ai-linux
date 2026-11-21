@@ -1,7 +1,8 @@
-"""Shared conversion pipeline used by the CLIs and the macOS app."""
+"""Shared conversion pipeline used by the CLI tools."""
 
 from __future__ import annotations
 
+import logging
 import multiprocessing
 import shutil
 import subprocess
@@ -19,6 +20,8 @@ from .progress import (
     WorkTotals,
     set_sink,
 )
+
+logger = logging.getLogger(__name__)
 
 SOURCE_SUFFIXES = {".docx", ".pdf", ".pptx"}
 
@@ -91,29 +94,36 @@ def filter_sources(paths: Iterable[Path | str]) -> tuple[list[Path], list[Reject
     return valid, rejected
 
 
-def sort_sources(paths: Iterable[Path]) -> list[Path]:
-    """Stable, Finder-friendly ordering by file name."""
-    return sorted(paths, key=lambda path: path.name.casefold())
-
-
 def check_pandoc(sources: Sequence[Path]) -> str | None:
-    """Return an error message when Pandoc is needed but unavailable."""
+    """Return an error message when Pandoc is missing or too old."""
     if not any(path.suffix.lower() in {".docx", ".pptx"} for path in sources):
         return None
-    from .pandoc import find_pandoc
+    from .pandoc import find_pandoc, pandoc_supports_pptx
 
-    if find_pandoc():
-        return None
-    return "pandoc not found. Install it with: brew install pandoc"
+    if not find_pandoc():
+        return (
+            "pandoc not found in PATH. Install Pandoc with your system package "
+            "manager."
+        )
+    if any(path.suffix.lower() == ".pptx" for path in sources) and not pandoc_supports_pptx():
+        return (
+            "this Pandoc cannot read .pptx files; Pandoc 3.0 or newer is "
+            "required for PowerPoint input. Upgrade Pandoc, or convert the "
+            "slides to PDF/DOCX first."
+        )
+    return None
 
 
-def check_tesseract(engine: str) -> str | None:
-    """Tesseract is opt-in and must be supplied by the user."""
-    if engine != "tesseract":
+def check_tesseract(use_ocr: bool) -> str | None:
+    """Tesseract must be supplied by the user when OCR is enabled."""
+    if not use_ocr:
         return None
     if shutil.which("tesseract"):
         return None
-    return "--tesseract requires Tesseract. Install it with: brew install tesseract"
+    return (
+        "tesseract not found in PATH. Install the Tesseract binary, or pass "
+        "--no-ocr. The English language data is bundled."
+    )
 
 
 def count_work(sources: Sequence[Path]) -> WorkTotals:
@@ -126,7 +136,8 @@ def count_work(sources: Sequence[Path]) -> WorkTotals:
         try:
             pages += count_pages(source)
             ocr += count_ocr_jobs(source)
-        except Exception:  # noqa: BLE001 - conversion will report the real error
+        except Exception as exc:  # noqa: BLE001 - conversion reports the real error
+            logger.debug("could not count work for %s: %s", source, exc)
             continue
     return WorkTotals(pages=pages, ocr=ocr)
 
@@ -134,12 +145,10 @@ def count_work(sources: Sequence[Path]) -> WorkTotals:
 def convert_batch(
     sources: Sequence[Path],
     *,
-    engine: str,
     use_ocr: bool,
     jobs: int,
     progress: ProgressCallback | None = None,
     work_progress: WorkProgressCallback | None = None,
-    force_process: bool = False,
 ) -> BatchResult:
     """Convert files, concatenate them, and return clipboard-ready Markdown.
 
@@ -148,8 +157,8 @@ def convert_batch(
     fails.  ``work_progress`` receives page/OCR counters aggregated across all
     files.
     """
-    # Imported lazily so the GUI can show its window before pymupdf, ocrmac
-    # and tiktoken are loaded.
+    # Imported lazily so the CLIs can report argument errors before pymupdf,
+    # tiktoken and the rest of the conversion stack are loaded.
     from .md4ai import convert_one
 
     sources = list(sources)
@@ -168,7 +177,7 @@ def convert_batch(
             for index, source in enumerate(sources)
         ]
 
-        use_processes = force_process or (jobs > 1 and total > 1)
+        use_processes = jobs > 1 and total > 1
         if not use_processes:
             sink = (
                 CallbackSink(state, work_progress)
@@ -180,7 +189,7 @@ def convert_batch(
             try:
                 for index, (source, output) in enumerate(planned, start=1):
                     try:
-                        details = convert_one(source, output, use_ocr, engine)
+                        details = convert_one(source, output, use_ocr)
                     except Exception as exc:  # noqa: BLE001 - report and continue
                         errors.append((source, str(exc)))
                         if progress:
@@ -220,9 +229,7 @@ def convert_batch(
                     initargs=initargs,
                 ) as pool:
                     futures = {
-                        pool.submit(
-                            convert_one, source, output, use_ocr, engine
-                        ): source
+                        pool.submit(convert_one, source, output, use_ocr): source
                         for source, output in planned
                     }
                     for future in as_completed(futures):
@@ -277,4 +284,27 @@ def count_tokens(text: str) -> int:
 
 
 def copy_to_clipboard(text: str) -> None:
-    subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
+    """Copy text using the first working Linux clipboard tool on PATH."""
+    data = text.encode("utf-8")
+    candidates = (
+        ("wl-copy", ["wl-copy"]),
+        ("xclip", ["xclip", "-selection", "clipboard"]),
+        ("xsel", ["xsel", "--clipboard", "--input"]),
+    )
+    errors: list[str] = []
+    for name, command in candidates:
+        if not shutil.which(name):
+            continue
+        try:
+            subprocess.run(command, input=data, check=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            errors.append(f"{name}: {exc}")
+            continue
+        return
+    if errors:
+        raise RuntimeError(
+            "could not write to the clipboard: " + "; ".join(errors)
+        )
+    raise RuntimeError(
+        "no clipboard tool found; install wl-clipboard, xclip, or xsel"
+    )
