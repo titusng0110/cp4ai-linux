@@ -29,6 +29,7 @@ def collect_sources(target: Path, recursive: bool) -> list[Path]:
             if path.is_file()
             and path.suffix.lower() in SOURCE_SUFFIXES
             and not path.name.startswith("~$")
+            and not any(part.startswith(".") for part in path.relative_to(target).parts)
         ]
         return sorted(sources, key=lambda path: path.as_posix().lower())
     raise ValueError(f"not found: {target}")

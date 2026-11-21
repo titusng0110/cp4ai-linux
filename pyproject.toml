@@ -12,7 +12,6 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
     "pymupdf==2.1",
     "numpy==2.5.5",
-    "ftfy==6.3.1",
     "tiktoken==0.14.0",
 ]
 

@@ -89,10 +89,6 @@ or from the project sites:
   https://github.com/openai/tiktoken
 - **NumPy** — BSD-3-Clause
   https://numpy.org/
-- **ftfy** — Apache-2.0
-  https://github.com/rspeer/python-ftfy
-- **wcwidth** — MIT
-  https://github.com/jquast/wcwidth
 - **PyYAML** — MIT
   https://pyyaml.org/
 - **NetworkX** — BSD-3-Clause

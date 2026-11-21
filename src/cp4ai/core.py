@@ -45,7 +45,6 @@ Reproducible environment
     Python 3.13
     pymupdf==2.1
     numpy==2.5.5
-    ftfy==6.3.1
     tiktoken==0.14.0
 """
 
@@ -69,7 +68,6 @@ from typing import NamedTuple
 from urllib.parse import unquote
 from xml.etree import ElementTree as ET
 
-import ftfy
 import numpy as np
 import pymupdf
 
@@ -167,9 +165,7 @@ def front_matter(path: Path, source_format: str, **extra: object) -> str:
 
 def write_markdown(out_path: Path, body: str) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # Run once per document: repairs double-encoded UTF-8 without touching
-    # legitimate Unicode or formatting.
-    out_path.write_text(ftfy.fix_text(body.rstrip()) + "\n", encoding="utf-8")
+    out_path.write_text(body.rstrip() + "\n", encoding="utf-8")
 
 
 def token_set(text: str) -> set[str]:

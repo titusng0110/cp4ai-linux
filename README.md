@@ -156,6 +156,11 @@ distribution's language packages. It runs on:
 Each OCR region uses one Tesseract process at a time (`OMP_THREAD_LIMIT=1`);
 parallelism is controlled by `--jobs`.
 
+OCR that duplicates a page's native text layer is dropped only when the
+whitespace-stripped image text is an ordered subsequence of the
+whitespace-stripped native text for that page. Case, punctuation and character
+order still matter.
+
 If a vector drawing cannot be rendered, the Markdown lists it under
 `## Vector images (not OCR'd)` instead of dropping it silently.
 
