@@ -181,6 +181,31 @@ def useful_ocr(text: str) -> bool:
     return len(re.sub(r"\s+", "", text)) >= 10
 
 
+def is_ordered_subsequence_after_stripping_whitespace(
+    candidate: str, text: str
+) -> bool:
+    """Return whether candidate is an ordered subsequence of text.
+
+    All Unicode whitespace is removed from both strings first. Case,
+    punctuation and duplicate characters remain significant. This is used to
+    drop OCR only when it already appears, in order, in the same page's native
+    text layer.
+    """
+    needle = [char for char in candidate if not char.isspace()]
+    if not needle:
+        return True
+
+    index = 0
+    for char in text:
+        if char.isspace():
+            continue
+        if char == needle[index]:
+            index += 1
+            if index == len(needle):
+                return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # DOCX conversion
 # ---------------------------------------------------------------------------
@@ -1512,7 +1537,9 @@ def convert_pdf(
                     ocr_text = ocr_page_images(
                         page, page_index + 1, workdir, cache, native
                     )
-                    if ocr_text and token_set(ocr_text) <= token_set(native):
+                    if ocr_text and is_ordered_subsequence_after_stripping_whitespace(
+                        ocr_text, native
+                    ):
                         ocr_text = ""
                 if ocr_text:
                     ocr_pages += 1
